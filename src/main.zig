@@ -97,7 +97,10 @@ fn handleConnection(
     defer allocator.free(resolved);
 
     var file = std.fs.cwd().openFile(resolved, .{}) catch |err| switch (err) {
-        error.FileNotFound => {
+        error.FileNotFound => retry: {
+            if (try maybeMaterializeRequestedTarball(allocator, root, routed_path)) {
+                break :retry try std.fs.cwd().openFile(resolved, .{});
+            }
             try http.sendSimpleResponse(connection, "404 Not Found", "text/plain", "not found\n");
             return;
         },
@@ -259,6 +262,90 @@ fn handleUpdate(
     ;
     try http.writeHeaders(connection, "200 OK", "application/json", body.len);
     try connection.stream.writeAll(body);
+}
+
+fn maybeMaterializeRequestedTarball(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    request_path: []const u8,
+) !bool {
+    if (!std.mem.startsWith(u8, request_path, "/p/")) return false;
+    if (!std.mem.endsWith(u8, request_path, ".tar.gz")) return false;
+
+    var parts = std.mem.splitScalar(u8, request_path[1..], '/');
+    const prefix = parts.next() orelse return false;
+    const package_name = parts.next() orelse return false;
+    const kind = parts.next() orelse return false;
+    const tarball_name = parts.next() orelse return false;
+    if (parts.next() != null) return false;
+    if (!std.mem.eql(u8, prefix, "p")) return false;
+    if (!std.mem.eql(u8, kind, "tag")) return false;
+    if (!std.mem.endsWith(u8, tarball_name, ".tar.gz")) return false;
+
+    const tag = tarball_name[0 .. tarball_name.len - ".tar.gz".len];
+    var source_record = (try sync.lookupSourceRecordByPackage(allocator, root, package_name)) orelse return false;
+    defer sync.freeSourceRecord(allocator, &source_record);
+    if (source_record.repo_url.len == 0) return false;
+
+    try materializeTarballOnDemand(allocator, root, package_name, tag, source_record.repo_url);
+    return true;
+}
+
+fn materializeTarballOnDemand(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    package_name: []const u8,
+    tag: []const u8,
+    repo_url: []const u8,
+) !void {
+    const pkg_dir = try std.fs.path.join(allocator, &.{ root, "p", package_name, "tag" });
+    defer allocator.free(pkg_dir);
+    try shell.runCommand(allocator, &.{ "mkdir", "-p", pkg_dir });
+
+    const tarball_name = try std.fmt.allocPrint(allocator, "{s}.tar.gz", .{tag});
+    defer allocator.free(tarball_name);
+    const tarball_path = try std.fs.path.join(allocator, &.{ pkg_dir, tarball_name });
+    defer allocator.free(tarball_path);
+
+    if (std.fs.cwd().access(tarball_path, .{})) |_| {
+        return;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/packbase-ondemand-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(tmp_path);
+    defer std.fs.deleteTreeAbsolute(tmp_path) catch {};
+
+    try shell.runCommand(allocator, &.{ "git", "init", "--quiet", tmp_path });
+    try shell.runCommand(allocator, &.{ "git", "-C", tmp_path, "remote", "add", "origin", repo_url });
+
+    const tag_ref = try std.fmt.allocPrint(allocator, "refs/tags/{s}:refs/tags/{s}", .{ tag, tag });
+    defer allocator.free(tag_ref);
+    try shell.runCommand(allocator, &.{
+        "git", "-c", "protocol.file.allow=always", "-c", "safe.directory=*",
+        "-C", tmp_path, "fetch", "--depth", "1", "--quiet", "origin", tag_ref,
+    });
+
+    const checkout_target = try std.fmt.allocPrint(allocator, "tags/{s}", .{tag});
+    defer allocator.free(checkout_target);
+    try shell.runCommand(allocator, &.{ "git", "-C", tmp_path, "checkout", "--quiet", checkout_target });
+
+    const stage_path = try std.fmt.allocPrint(allocator, "{s}_stage", .{tmp_path});
+    defer allocator.free(stage_path);
+    defer std.fs.deleteTreeAbsolute(stage_path) catch {};
+
+    try shell.runCommand(allocator, &.{ "cp", "-r", tmp_path, stage_path });
+    const stage_git = try std.fs.path.join(allocator, &.{ stage_path, ".git" });
+    defer allocator.free(stage_git);
+    std.fs.deleteTreeAbsolute(stage_git) catch {};
+
+    const stage_parent = std.fs.path.dirname(stage_path) orelse "/tmp";
+    const stage_base = std.fs.path.basename(stage_path);
+    try shell.runCommand(allocator, &.{ "tar", "czf", tarball_path, "-C", stage_parent, stage_base });
+
+    std.log.info("tarball materialized on demand package={s} tag={s}", .{ package_name, tag });
 }
 
 fn updateWorker(args: *UpdateWorkerArgs) void {

@@ -184,25 +184,56 @@ pub fn syncSourceRepos(
     refresh_existing: bool,
     stats: *types.SyncStats,
 ) !void {
-    for (records, 0..) |record, index| {
-        if (record.repo_url.len == 0) continue;
-        const action = ensureSourceRepo(allocator, root, record, refresh_existing, stats) catch |err| {
-            stats.source_repo_failed += 1;
-            std.log.warn(
-                "source repo [{d}/{d}] failed package={s} url={s} error={s}",
-                .{ index + 1, records.len, record.package_name, record.repo_url, @errorName(err) },
-            );
-            continue;
-        };
+    _ = allocator;
+    _ = root;
+    _ = refresh_existing;
+    _ = stats;
+    if (records.len != 0) {
         std.log.info(
-            "source repo [{d}/{d}] package={s} action={s}",
-            .{ index + 1, records.len, record.package_name, @tagName(action) },
+            "source repo materialization skipped for {d} records; tarballs are now created on demand",
+            .{records.len},
         );
     }
 }
 
 pub fn freeSourceRecordList(allocator: std.mem.Allocator, records: *std.ArrayList(types.SourceRecord)) void {
     freeSourceRecords(allocator, records);
+}
+
+pub fn lookupSourceRecordByPackage(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    package_name: []const u8,
+) !?types.SourceRecord {
+    const state_dir = try ensureStateDir(allocator, root);
+    defer allocator.free(state_dir);
+    const current_path = try std.fs.path.join(allocator, &.{ state_dir, "source.json" });
+    defer allocator.free(current_path);
+
+    const raw = try readOptionalFileAlloc(allocator, current_path, 16 * 1024 * 1024) orelse return null;
+    defer allocator.free(raw);
+
+    var records = try extractSourceRecords(allocator, raw);
+    defer freeSourceRecords(allocator, &records);
+
+    for (records.items) |record| {
+        if (!std.mem.eql(u8, record.package_name, package_name)) continue;
+        return .{
+            .id = try allocator.dupe(u8, record.id),
+            .repo_url = try allocator.dupe(u8, record.repo_url),
+            .package_name = try allocator.dupe(u8, record.package_name),
+            .default_ref = try allocator.dupe(u8, record.default_ref),
+        };
+    }
+    return null;
+}
+
+pub fn freeSourceRecord(allocator: std.mem.Allocator, record: *types.SourceRecord) void {
+    allocator.free(record.id);
+    allocator.free(record.repo_url);
+    allocator.free(record.package_name);
+    allocator.free(record.default_ref);
+    record.* = undefined;
 }
 
 fn ensureStateDir(allocator: std.mem.Allocator, root: []const u8) ![]u8 {

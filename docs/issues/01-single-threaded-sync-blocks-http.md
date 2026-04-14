@@ -1,5 +1,7 @@
 # Issue 01 — Sync operation blocks all HTTP responses
 
+Status: completed locally on April 15, 2026
+
 ## Summary
 
 When `/api/update` is called, the server becomes completely unresponsive to all other HTTP
@@ -61,7 +63,27 @@ the lock state is handled. Per-thread GPA allocators avoid contention on the sha
 
 ## Status
 
-- [ ] Design thread ownership / allocator model
-- [ ] Implement `syncWorker` + `SyncArgs`
-- [ ] Verify lock semantics under concurrent `/api/update` calls
-- [ ] Update smoke test to poll `/api/info` for `state == "idle"` instead of waiting inline
+- [x] Design thread ownership / allocator model
+- [x] Implement `syncWorker` + `SyncArgs`
+- [x] Verify lock semantics under concurrent `/api/update` calls
+- [x] Update smoke test to poll `/api/info` for `state == "idle"` instead of waiting inline
+
+## Verification
+
+A focused local verification was executed against the current server build:
+
+- `POST /api/update` returned immediately with `{"status":"started"}`
+- `GET /api/info` remained available during the sync and reported `state:"running"`
+- `GET /api/info` eventually returned `state:"idle"` with updated sync counters
+
+Observed output:
+
+```text
+update_start={"status":"started"}
+info_during={"service":"packbase","release":"r0012","update":{"state":"running",...}}
+info_final={"service":"packbase","release":"r0012","update":{"state":"idle",...,"source_repo_cloned":1,...}}
+```
+
+Note: the full `test/smoke.sh` flow still stops earlier on an unrelated local
+pseudo-Git clone problem, so the end-to-end smoke needs a separate pass once
+that independent issue is addressed.
