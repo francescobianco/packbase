@@ -1,6 +1,6 @@
 # Issue 03 — `zig fetch git+https://…` fails with `EndOfStream` during ls-refs
 
-Status: not completed on April 15, 2026 in release `r0012`
+Status: resolved on April 15, 2026 — single-read bug in handleConnection fixed; see issue 05 for the follow-on pack-download fix
 
 ## Summary
 
