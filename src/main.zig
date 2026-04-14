@@ -49,10 +49,30 @@ fn handleConnection(
 ) !void {
     const buffer = try allocator.alloc(u8, 65536);
     defer allocator.free(buffer);
-    const bytes_read = try connection.stream.read(buffer);
-    if (bytes_read == 0) return;
 
-    const raw = buffer[0..bytes_read];
+    // Read until we have the complete HTTP headers.
+    var total_read: usize = 0;
+    const header_end = blk: while (true) {
+        if (total_read >= buffer.len) return error.RequestTooLarge;
+        const n = try connection.stream.read(buffer[total_read..]);
+        if (n == 0) return;
+        total_read += n;
+        if (std.mem.indexOf(u8, buffer[0..total_read], "\r\n\r\n")) |pos| break :blk pos + 4;
+    };
+
+    // If the request has a body, keep reading until Content-Length bytes are received.
+    if (http.findHeader(buffer[0..header_end], "Content-Length")) |cl_str| {
+        const content_length = std.fmt.parseInt(usize, std.mem.trim(u8, cl_str, " "), 10) catch 0;
+        const needed = header_end + content_length;
+        if (needed > buffer.len) return error.RequestTooLarge;
+        while (total_read < needed) {
+            const n = try connection.stream.read(buffer[total_read..needed]);
+            if (n == 0) return error.UnexpectedEof;
+            total_read += n;
+        }
+    }
+
+    const raw = buffer[0..total_read];
     const request = try http.parseRequest(raw);
     const path = http.requestPath(request.target);
     const head_only = std.mem.eql(u8, request.method, "HEAD");
