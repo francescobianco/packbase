@@ -5,15 +5,31 @@
 [![Zig](https://img.shields.io/badge/Zig-0.15-orange.svg)](https://ziglang.org)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED.svg)](Dockerfile)
 
-**packbase** is a self-hosted distribution layer for Zig packages.  
-It mirrors upstream Git repositories, materialises deterministic tarballs, and serves them over HTTP so that `zig fetch` never has to reach GitHub at install time.
+**packbase** is a self-hosted distribution layer for Zig packages built around one idea that must stay fixed:
+the primary artifact is the tarball, not the Git repository.
+
+This project matters because it defines a stricter and more reliable contract for package distribution:
+- packbase stores deterministic release tarballs under `/p/<pkg>/tag/<tag>.tar.gz`
+- `update` and `fetch` build and refresh the internal state of the registry
+- the backend must know tags, versions, and package metadata from that internal state
+- the Git-facing surface is only a pseudo-Git compatibility layer for clients such as `zig fetch`
+- packbase must not depend on hosting or exposing persistent mirrored Git repositories as its source of truth
+- packbase must not execute Git operations at request time just to discover what package data exists
+
+In other words: Git is an ingress protocol and a compatibility interface, not the backend data model.
+The backend truth is the tarball set plus the state derived from updates.
+
+This distinction is the core value of the project. It makes packbase closer to a real package registry:
+stable, cacheable, inspectable, and operationally simpler than a Git mirror disguised as one.
 
 ```
-upstream Git  ──►  packbase /api/fetch  ──►  /p/<pkg>/tag/<tag>.tar.gz
-                                                    │
-                                                    ▼
-                                         zig fetch --save http://packbase/…
+upstream Git  ──►  packbase fetch/update  ──►  internal state + tarballs
+                                                      │
+                                                      ├─► /p/<pkg>/tag/<tag>.tar.gz
+                                                      └─► pseudo-Git interface for clients
 ```
+
+`zig fetch` should be able to talk to packbase as if it were speaking to Git, while packbase internally remains a tarball-first registry.
 
 ---
 

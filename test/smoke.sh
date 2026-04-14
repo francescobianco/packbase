@@ -113,21 +113,39 @@ docker run -d \
     >/dev/null
 
 for _ in $(seq 1 30); do
-    if curl -fsS "http://127.0.0.1:${HOST_PORT}/git/hello.git/info/refs" >/dev/null 2>&1; then
+    if curl -fsS "http://127.0.0.1:${HOST_PORT}/hello/info/refs" >/dev/null 2>&1; then
         break
     fi
     sleep 1
 done
 
-# ── Phase 4: verify git clone works ──────────────────────────────────────────
-git clone "http://127.0.0.1:${HOST_PORT}/git/hello.git" "$TMP_DIR/hello" >/dev/null 2>&1
+# ── Phase 4: verify pseudo-git works from tarball-backed package ─────────────
+git clone "http://127.0.0.1:${HOST_PORT}/hello" "$TMP_DIR/hello" >/dev/null 2>&1
 
 test -f "$TMP_DIR/hello/build.zig.zon"
 grep -q 'hello_fixture' "$TMP_DIR/hello/build.zig.zon"
 
-printf 'git clone: OK\n'
+printf 'pseudo-git clone: OK\n'
 
-# ── Phase 5: mirror a remote package via POST /api/fetch ─────────────────────
+# ── Phase 5: verify pseudo-git ls-refs works on short package URL ────────────
+LS_REFS_REQ="$TMP_DIR/ls-refs.req"
+LS_REFS_RESP="$TMP_DIR/ls-refs.resp"
+
+printf '0014command=ls-refs\n0017object-format=sha1\n00010009peel\n0000' > "$LS_REFS_REQ"
+
+curl -fsS \
+    -H 'Git-Protocol: version=2' \
+    -H 'Content-Type: application/x-git-upload-pack-request' \
+    --data-binary "@${LS_REFS_REQ}" \
+    "http://127.0.0.1:${HOST_PORT}/hello/git-upload-pack" \
+    -o "$LS_REFS_RESP"
+
+grep -a -q 'refs/heads/main' "$LS_REFS_RESP"
+test "$(tail -c 4 "$LS_REFS_RESP")" = '0000'
+
+printf 'pseudo-git ls-refs: OK\n'
+
+# ── Phase 6: mirror a remote package via POST /api/fetch ─────────────────────
 # Packbase clones the upstream repo, resolves the latest tag, materialises a
 # tarball, and stores it under /p/<name>/tag/<tag>.tar.gz.  The response body
 # carries the local URL where the package is now available.
@@ -147,7 +165,7 @@ test -n "$PKG_URL"
 
 printf 'api/fetch: OK (%s)\n' "$PKG_URL"
 
-# ── Phase 5b: list packages available on this instance ───────────────────────
+# ── Phase 6b: list packages available on this instance ───────────────────────
 LIST_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/list")"
 
 printf 'api/list response: %s\n' "$LIST_RESP"
@@ -161,7 +179,7 @@ fi
 
 printf 'api/list: OK\n'
 
-# ── Phase 5c: break local package state and repair it via /api/update ────────
+# ── Phase 6c: break local package state and repair it via /api/update ────────
 docker exec "$CONTAINER_NAME" rm -rf /var/lib/packbase/public/p/hello
 
 BROKEN_LIST_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/list")"
@@ -189,7 +207,7 @@ curl -fsS "http://127.0.0.1:${HOST_PORT}/p/remote-only/tag/v0.1.0.tar.gz" >/dev/
 
 printf 'api/update: OK\n'
 
-# ── Phase 5d: verify the release identifier exposed by this build ────────────
+# ── Phase 6d: verify the release identifier exposed by this build ────────────
 RELEASE_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/info")"
 
 printf 'api/info response: %s\n' "$RELEASE_RESP"
@@ -200,7 +218,7 @@ printf '%s' "$RELEASE_RESP" | grep -q '"source_repo_cloned":1'
 
 printf 'api/info: OK\n'
 
-# ── Phase 6: install the mirrored package with zig fetch --save ───────────────
+# ── Phase 7: install the mirrored package with zig fetch --save ───────────────
 # The Zig runner resolves the package from packbase (not from GitHub), which is
 # the core promise of the service.
 FETCH_DIR="$TMP_DIR/fetch-project"

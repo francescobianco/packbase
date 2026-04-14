@@ -468,6 +468,13 @@ fn ensureGitCacheFromTarballs(allocator: std.mem.Allocator, root: []const u8, pk
     errdefer allocator.free(cache_dir);
 
     const needs_rebuild = blk: {
+        const head_path = try std.fs.path.join(allocator, &.{ cache_dir, "HEAD" });
+        defer allocator.free(head_path);
+        if (std.fs.cwd().access(head_path, .{})) |_| {} else |err| switch (err) {
+            error.FileNotFound => break :blk true,
+            else => return err,
+        }
+
         const output = shell.runCommandOutput(allocator, &.{ "git", "-C", cache_dir, "tag" }) catch break :blk true;
         defer allocator.free(output);
         var count: usize = 0;
@@ -661,21 +668,15 @@ fn handleUploadPackRequest(
     };
     defer allocator.free(out);
 
-    // In git protocol v2, each command response must be terminated with a "0002"
-    // response-end packet. Without it zig fetch (and other v2 clients) stall
-    // waiting for more data and surface the connection close as EndOfStream.
-    const suffix: []const u8 = if (use_v2) "0002" else "";
-    const body_len = out.len + suffix.len;
     var headers: [128]u8 = undefined;
     const resp = try std.fmt.bufPrint(
         &headers,
         "HTTP/1.1 200 OK\r\nContent-Type: " ++
             "application/x-git-upload-pack-result\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
-        .{body_len},
+        .{out.len},
     );
     try connection.stream.writeAll(resp);
     if (!head_only) {
         try connection.stream.writeAll(out);
-        if (suffix.len > 0) try connection.stream.writeAll(suffix);
     }
 }
