@@ -133,7 +133,27 @@ build servita.
 ```json
 {
   "service": "packbase",
-  "release": "r0003"
+  "release": "r0004"
+}
+```
+
+### `POST /api/update`
+
+Riallinea in modo soft lo stato interno usando i repository ospitati sotto
+`/git` come sorgente di verità. Rigenera i tarball mancanti sotto `/p`,
+aggiorna `update-server-info` e ripara un'istanza parzialmente incoerente.
+
+Quando `PACKBASE_TOKEN` è impostato richiede:
+- `Authorization: Bearer <token>`
+
+**Response `200`**
+```json
+{
+  "status": "ok",
+  "repos_scanned": 1,
+  "packages_synced": 1,
+  "tarballs_created": 1,
+  "tarballs_present": 0
 }
 ```
 
@@ -175,13 +195,23 @@ The smoke test:
 To verify the short Git URL directly, run:
 
 ```bash
-bash test/remote.sh pb.yafb.net hello r0003
+bash test/remote.sh pb.yafb.net hello r0004
 ```
 
 Or:
 
 ```bash
-PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0003 bash test/remote.sh
+PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0004 bash test/remote.sh
+```
+
+Se vuoi che il test remoto provi automaticamente a riparare l'istanza quando il
+pacchetto manca in `/api/list`, passa anche il token:
+
+```bash
+PACKBASE_REMOTE_DOMAIN=pb.yafb.net \
+PACKBASE_EXPECTED_RELEASE=r0004 \
+PACKBASE_REMOTE_TOKEN=... \
+bash test/remote.sh
 ```
 
 Artefacts survive in `test/tmp/` for inspection after the run.

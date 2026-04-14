@@ -105,7 +105,32 @@ printf '%s' "$LIST_RESP" | grep -q '"serde.zig"'
 
 printf 'api/list: OK\n'
 
-# ── Phase 5c: verify the release identifier exposed by this build ────────────
+# ── Phase 5c: break local package state and repair it via /api/update ────────
+docker exec "$CONTAINER_NAME" rm -rf /var/lib/packbase/public/p/hello
+
+BROKEN_LIST_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/list")"
+printf 'broken api/list response: %s\n' "$BROKEN_LIST_RESP"
+if printf '%s' "$BROKEN_LIST_RESP" | grep -q '"hello"'; then
+    printf 'expected hello to disappear after removing /p/hello\n' >&2
+    exit 1
+fi
+
+UPDATE_RESP="$(curl -fsS \
+    -X POST \
+    -H "Authorization: Bearer ${API_TOKEN}" \
+    "http://127.0.0.1:${HOST_PORT}/api/update")"
+
+printf 'api/update response: %s\n' "$UPDATE_RESP"
+printf '%s' "$UPDATE_RESP" | grep -q '"status":"ok"'
+printf '%s' "$UPDATE_RESP" | grep -q '"tarballs_created":'
+
+REPAIRED_LIST_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/list")"
+printf 'repaired api/list response: %s\n' "$REPAIRED_LIST_RESP"
+printf '%s' "$REPAIRED_LIST_RESP" | grep -q '"hello"'
+
+printf 'api/update: OK\n'
+
+# ── Phase 5d: verify the release identifier exposed by this build ────────────
 RELEASE_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/info")"
 
 printf 'api/info response: %s\n' "$RELEASE_RESP"

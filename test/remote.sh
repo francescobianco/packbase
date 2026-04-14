@@ -11,6 +11,8 @@ REMOTE_URL="${SCHEME}://${DOMAIN}/${REPO_NAME}"
 TARGET_DIR="$TMP_DIR/remote-clone"
 INFO_URL="${SCHEME}://${DOMAIN}/api/info"
 LIST_URL="${SCHEME}://${DOMAIN}/api/list"
+UPDATE_URL="${SCHEME}://${DOMAIN}/api/update"
+REMOTE_TOKEN="${PACKBASE_REMOTE_TOKEN:-}"
 
 if [ -z "$DOMAIN" ]; then
     printf 'usage: %s <domain> [repo] [expected-release]\n' "${BASH_SOURCE[0]}" >&2
@@ -46,6 +48,18 @@ if ! LIST_RESP="$(curl -fsS "$LIST_URL")"; then
     printf 'remote list endpoint not available: %s\n' "$LIST_URL" >&2
     printf 'expected a deployed packbase instance exposing /api/list\n' >&2
     exit 1
+fi
+
+if ! printf '%s' "$LIST_RESP" | grep -q "\"${REPO_NAME}\""; then
+    if [ -n "$REMOTE_TOKEN" ]; then
+        printf 'package %s missing from list, trying soft sync via /api/update\n' "$REPO_NAME"
+        UPDATE_RESP="$(curl -fsS \
+            -X POST \
+            -H "Authorization: Bearer ${REMOTE_TOKEN}" \
+            "$UPDATE_URL")"
+        printf 'api/update response: %s\n' "$UPDATE_RESP"
+        LIST_RESP="$(curl -fsS "$LIST_URL")"
+    fi
 fi
 
 if ! printf '%s' "$LIST_RESP" | grep -q "\"${REPO_NAME}\""; then

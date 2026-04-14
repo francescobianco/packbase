@@ -10,6 +10,13 @@ const FetchPayload = struct {
     url: []const u8,
 };
 
+const SyncStats = struct {
+    repos_scanned: usize = 0,
+    packages_synced: usize = 0,
+    tarballs_created: usize = 0,
+    tarballs_present: usize = 0,
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -51,12 +58,19 @@ fn handleConnection(
     const request = try parseRequest(raw);
     const path = requestPath(request.target);
 
-    if (std.mem.eql(u8, request.method, "POST") and std.mem.eql(u8, path, "/api/fetch")) {
-        try handleFetch(allocator, connection, root, token, raw);
-        return;
+    const head_only = std.mem.eql(u8, request.method, "HEAD");
+    if (std.mem.eql(u8, request.method, "POST")) {
+        if (std.mem.eql(u8, path, "/api/fetch")) {
+            try handleFetch(allocator, connection, root, token, raw);
+            return;
+        }
+
+        if (std.mem.eql(u8, path, "/api/update")) {
+            try handleUpdate(allocator, connection, root, token, raw);
+            return;
+        }
     }
 
-    const head_only = std.mem.eql(u8, request.method, "HEAD");
     if (!std.mem.eql(u8, request.method, "GET") and !head_only) {
         try sendSimpleResponse(connection, "405 Method Not Allowed", "text/plain", "method not allowed\n");
         return;
@@ -115,20 +129,7 @@ fn handleFetch(
     token: ?[]const u8,
     raw: []const u8,
 ) !void {
-    // Validate Bearer token when PACKBASE_TOKEN is set.
-    if (token) |expected| {
-        const auth = findHeader(raw, "Authorization") orelse {
-            try sendSimpleResponse(connection, "401 Unauthorized", "text/plain", "unauthorized\n");
-            return;
-        };
-        const prefix = "Bearer ";
-        if (!std.mem.startsWith(u8, auth, prefix) or
-            !std.mem.eql(u8, auth[prefix.len..], expected))
-        {
-            try sendSimpleResponse(connection, "403 Forbidden", "text/plain", "forbidden\n");
-            return;
-        }
-    }
+    if (!try authorizeRequest(connection, token, raw)) return;
 
     // Parse JSON body: {"url": "git+https://..."}
     const body = findBody(raw);
@@ -237,6 +238,32 @@ fn handleFetch(
     try connection.stream.writeAll(resp_body);
 }
 
+fn handleUpdate(
+    allocator: std.mem.Allocator,
+    connection: *std.net.Server.Connection,
+    root: []const u8,
+    token: ?[]const u8,
+    raw: []const u8,
+) !void {
+    if (!try authorizeRequest(connection, token, raw)) return;
+
+    const stats = syncPackages(allocator, root) catch |err| {
+        std.log.warn("sync failed: {s}", .{@errorName(err)});
+        try sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "sync failed\n");
+        return;
+    };
+
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"status\":\"ok\",\"repos_scanned\":{d},\"packages_synced\":{d},\"tarballs_created\":{d},\"tarballs_present\":{d}}}\n",
+        .{ stats.repos_scanned, stats.packages_synced, stats.tarballs_created, stats.tarballs_present },
+    );
+    defer allocator.free(body);
+
+    try writeHeaders(connection, "200 OK", "application/json", body.len);
+    try connection.stream.writeAll(body);
+}
+
 fn handleList(
     allocator: std.mem.Allocator,
     connection: *std.net.Server.Connection,
@@ -268,6 +295,140 @@ fn handleInfo(
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+fn authorizeRequest(
+    connection: *std.net.Server.Connection,
+    token: ?[]const u8,
+    raw: []const u8,
+) !bool {
+    if (token) |expected| {
+        const auth = findHeader(raw, "Authorization") orelse {
+            try sendSimpleResponse(connection, "401 Unauthorized", "text/plain", "unauthorized\n");
+            return false;
+        };
+        const prefix = "Bearer ";
+        if (!std.mem.startsWith(u8, auth, prefix) or
+            !std.mem.eql(u8, auth[prefix.len..], expected))
+        {
+            try sendSimpleResponse(connection, "403 Forbidden", "text/plain", "forbidden\n");
+            return false;
+        }
+    }
+    return true;
+}
+
+fn syncPackages(allocator: std.mem.Allocator, root: []const u8) !SyncStats {
+    const git_root = try std.fs.path.join(allocator, &.{ root, "git" });
+    defer allocator.free(git_root);
+
+    var dir = std.fs.cwd().openDir(git_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return .{},
+        else => return err,
+    };
+    defer dir.close();
+
+    var stats = SyncStats{};
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".git")) continue;
+
+        stats.repos_scanned += 1;
+        const repo_name = entry.name[0 .. entry.name.len - 4];
+        try syncRepoPackage(allocator, root, entry.name, repo_name, &stats);
+    }
+
+    return stats;
+}
+
+fn syncRepoPackage(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    repo_dir_name: []const u8,
+    package_name: []const u8,
+    stats: *SyncStats,
+) !void {
+    const repo_path = try std.fs.path.join(allocator, &.{ root, "git", repo_dir_name });
+    defer allocator.free(repo_path);
+
+    try runCommand(allocator, &[_][]const u8{ "git", "-C", repo_path, "update-server-info" });
+
+    const tags_raw = runCommandOutput(allocator, &[_][]const u8{ "git", "-C", repo_path, "tag", "--list" }) catch {
+        return;
+    };
+    defer allocator.free(tags_raw);
+
+    var saw_tag = false;
+    var tags = std.mem.splitScalar(u8, tags_raw, '\n');
+    while (tags.next()) |raw_tag| {
+        const tag = std.mem.trim(u8, raw_tag, " \t\r");
+        if (tag.len == 0) continue;
+        saw_tag = true;
+        try ensureRepoTarball(allocator, root, repo_path, package_name, tag, stats);
+    }
+
+    if (saw_tag) stats.packages_synced += 1;
+}
+
+fn ensureRepoTarball(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    repo_path: []const u8,
+    package_name: []const u8,
+    tag: []const u8,
+    stats: *SyncStats,
+) !void {
+    const pkg_dir = try std.fs.path.join(allocator, &.{ root, "p", package_name, "tag" });
+    defer allocator.free(pkg_dir);
+    try runCommand(allocator, &[_][]const u8{ "mkdir", "-p", pkg_dir });
+
+    const tarball_name = try std.fmt.allocPrint(allocator, "{s}.tar.gz", .{tag});
+    defer allocator.free(tarball_name);
+    const tarball_path = try std.fs.path.join(allocator, &.{ pkg_dir, tarball_name });
+    defer allocator.free(tarball_path);
+
+    if (std.fs.cwd().access(tarball_path, .{})) |_| {
+        stats.tarballs_present += 1;
+        return;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    try archiveGitTag(allocator, repo_path, tag, tarball_path);
+    stats.tarballs_created += 1;
+}
+
+fn archiveGitTag(
+    allocator: std.mem.Allocator,
+    repo_path: []const u8,
+    tag: []const u8,
+    tarball_path: []const u8,
+) !void {
+    var file = try std.fs.cwd().createFile(tarball_path, .{ .truncate = true });
+    defer file.close();
+
+    var child = std.process.Child.init(&[_][]const u8{
+        "git", "-C", repo_path, "archive", "--format=tar.gz", tag,
+    }, allocator);
+    child.stdin_behavior = .Close;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try child.stdout.?.read(&buf);
+        if (n == 0) break;
+        try file.writeAll(buf[0..n]);
+    }
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
+}
 
 fn listPackagesJson(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     const packages_root = try std.fs.path.join(allocator, &.{ root, "p" });
@@ -536,6 +697,11 @@ fn sendLandingPage(connection: *std.net.Server.Connection, head_only: bool) !voi
         \\          <td><span class="method get">GET</span></td>
         \\          <td><code>/api/list</code></td>
         \\          <td>Return the list of mirrored packages currently available on this instance.</td>
+        \\        </tr>
+        \\        <tr>
+        \\          <td><span class="method post">POST</span></td>
+        \\          <td><code>/api/update</code></td>
+        \\          <td>Soft-sync package tarballs from hosted Git repositories and repair internal state.</td>
         \\        </tr>
         \\        <tr>
         \\          <td><span class="method get">GET</span></td>
