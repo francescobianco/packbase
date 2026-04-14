@@ -353,47 +353,58 @@ fn handleSmartHttp(
     raw: []const u8,
     head_only: bool,
 ) !void {
-    const path = http.requestPath(request.target);
-    const routed = try http.routePath(allocator, path);
-    defer allocator.free(routed);
+    const target = request.target;
+    const path = http.requestPath(target);
 
-    if (std.mem.startsWith(u8, routed, "/git/")) {
-        const after_git = routed[5..];
+    var repo_rel: []const u8 = undefined;
+    var git_prefixed: bool = undefined;
+
+    if (std.mem.startsWith(u8, path, "/git/")) {
+        git_prefixed = true;
+        const after_git = path[5..];
         const question = std.mem.indexOfScalar(u8, after_git, '?') orelse after_git.len;
-        var repo_rel = after_git[0..question];
-        if (std.mem.endsWith(u8, repo_rel, "/info/refs")) {
-            repo_rel = repo_rel[0 .. repo_rel.len - 10];
-        } else if (std.mem.endsWith(u8, repo_rel, "/git-upload-pack")) {
-            repo_rel = repo_rel[0 .. repo_rel.len - 15];
-        } else if (std.mem.endsWith(u8, repo_rel, "/git-receive-pack")) {
-            repo_rel = repo_rel[0 .. repo_rel.len - 17];
+        repo_rel = after_git[0..question];
+    } else if (http.isSmartHttpRequest(path)) {
+        git_prefixed = false;
+        if (std.mem.indexOfScalar(u8, path, '/')) |slash| {
+            repo_rel = path[1..slash];
+        } else {
+            repo_rel = path[1..];
         }
-
-        const repo_dir = try std.fs.path.join(allocator, &.{ root, "git", repo_rel });
-        defer allocator.free(repo_dir);
-
-        var dir = std.fs.cwd().openDir(repo_dir, .{}) catch {
-            try http.sendSimpleResponse(connection, "404 Not Found", "text/plain", "not found\n");
-            return;
-        };
-        defer dir.close();
-
-        if (std.mem.eql(u8, request.method, "GET")) {
-            try handleUploadPackAdvertise(allocator, connection, repo_dir, head_only);
-            return;
-        } else if (std.mem.eql(u8, request.method, "POST")) {
-            const content_type = http.findHeader(raw, "Content-Type") orelse "";
-            if (std.mem.eql(u8, content_type, "application/x-git-upload-pack-request")) {
-                try handleUploadPackRequest(allocator, connection, repo_dir, raw, head_only);
-                return;
-            }
-        }
-
-        try http.sendSimpleResponse(connection, "404 Not Found", "text/plain", "not found\n");
+    } else {
+        try http.sendSimpleResponse(connection, "400 Bad Request", "text/plain", "invalid request\n");
         return;
     }
 
-    try http.sendSimpleResponse(connection, "400 Bad Request", "text/plain", "invalid request\n");
+    if (std.mem.endsWith(u8, repo_rel, "/info/refs")) {
+        repo_rel = repo_rel[0 .. repo_rel.len - 10];
+    } else if (std.mem.endsWith(u8, repo_rel, "/git-upload-pack")) {
+        repo_rel = repo_rel[0 .. repo_rel.len - 15];
+    } else if (std.mem.endsWith(u8, repo_rel, "/git-receive-pack")) {
+        repo_rel = repo_rel[0 .. repo_rel.len - 17];
+    }
+
+    const repo_dir = try std.fs.path.join(allocator, &.{ root, "git", repo_rel });
+    defer allocator.free(repo_dir);
+
+    var dir = std.fs.cwd().openDir(repo_dir, .{}) catch {
+        try http.sendSimpleResponse(connection, "404 Not Found", "text/plain", "not found\n");
+        return;
+    };
+    defer dir.close();
+
+    if (std.mem.eql(u8, request.method, "GET")) {
+        try handleUploadPackAdvertise(allocator, connection, repo_dir, head_only);
+        return;
+    } else if (std.mem.eql(u8, request.method, "POST")) {
+        const content_type = http.findHeader(raw, "Content-Type") orelse "";
+        if (std.mem.eql(u8, content_type, "application/x-git-upload-pack-request")) {
+            try handleUploadPackRequest(allocator, connection, repo_dir, raw, head_only);
+            return;
+        }
+    }
+
+    try http.sendSimpleResponse(connection, "404 Not Found", "text/plain", "not found\n");
 }
 
 fn handleUploadPackAdvertise(
