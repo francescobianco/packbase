@@ -2,7 +2,7 @@
 set -eu
 
 output_dir="${1:-public/git}"
-fixtures_dir="${2:-fixtures}"
+fixtures_dir="${2:-test/fixtures}"
 
 mkdir -p "$output_dir"
 

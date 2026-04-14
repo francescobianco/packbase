@@ -14,7 +14,7 @@ COPY . .
 
 RUN /opt/zig/zig build -Doptimize=ReleaseSafe
 RUN mkdir -p /out/public/git
-RUN sh ./scripts/create-fixture-repos.sh /out/public/git ./fixtures
+RUN sh ./scripts/create-fixture-repos.sh /out/public/git ./test/fixtures
 RUN cp zig-out/bin/packbase /out/packbase
 
 FROM alpine:3.20
