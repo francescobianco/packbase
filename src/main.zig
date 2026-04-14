@@ -25,11 +25,13 @@ pub fn main() !void {
 
     while (true) {
         var connection = try server.accept();
-        defer connection.stream.close();
+        {
+            defer connection.stream.close();
 
-        handleConnection(allocator, &connection, root, token, source_url) catch |err| {
-            std.log.warn("request failed: {s}", .{@errorName(err)});
-        };
+            handleConnection(allocator, &connection, root, token, source_url) catch |err| {
+                std.log.warn("request failed: {s}", .{@errorName(err)});
+            };
+        }
     }
 }
 
