@@ -2,4 +2,6 @@
 .zig-cache/
 zig-out/
 test/tmp/
+data/
+!data/.gitkeep
 .env

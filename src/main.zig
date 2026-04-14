@@ -224,16 +224,33 @@ fn handleUpdate(
     std.log.info("update started source={s}", .{source_url});
     defer sync.finishUpdateWindow(allocator, root, &stats) catch {};
 
-    stats = sync.syncPackages(allocator, root) catch |err| {
+    var source_records = sync.syncSourceCatalog(allocator, root, source_url, &stats) catch |err| {
+        std.log.warn("source sync failed: {s}", .{@errorName(err)});
+        try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "source sync failed\n");
+        return;
+    };
+    defer sync.freeSourceRecordList(allocator, &source_records);
+
+    sync.syncSourceRepos(allocator, root, source_records.items, stats.source_changed or stats.source_added != 0 or stats.source_changed_count != 0, &stats) catch |err| {
+        std.log.warn("source repo materialization failed: {s}", .{@errorName(err)});
+        try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "source repo sync failed\n");
+        return;
+    };
+
+    const local_stats = sync.syncPackages(allocator, root) catch |err| {
         std.log.warn("sync failed: {s}", .{@errorName(err)});
         try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "sync failed\n");
         return;
     };
-    try sync.syncSourceIndex(allocator, root, source_url, &stats);
+    stats.repos_scanned = local_stats.repos_scanned;
+    stats.packages_synced = local_stats.packages_synced;
+    stats.tarballs_created = local_stats.tarballs_created;
+    stats.tarballs_present = local_stats.tarballs_present;
+    stats.default_seeded = local_stats.default_seeded;
 
     const body = try std.fmt.allocPrint(
         allocator,
-        "{{\"status\":\"ok\",\"repos_scanned\":{d},\"packages_synced\":{d},\"tarballs_created\":{d},\"tarballs_present\":{d},\"default_seeded\":{s},\"source_changed\":{s},\"source_packages\":{d},\"source_added\":{d},\"source_updated\":{d},\"source_removed\":{d}}}\n",
+        "{{\"status\":\"ok\",\"repos_scanned\":{d},\"packages_synced\":{d},\"tarballs_created\":{d},\"tarballs_present\":{d},\"default_seeded\":{s},\"source_changed\":{s},\"source_packages\":{d},\"source_added\":{d},\"source_updated\":{d},\"source_removed\":{d},\"source_repo_cloned\":{d},\"source_repo_updated\":{d},\"source_repo_failed\":{d}}}\n",
         .{
             stats.repos_scanned,
             stats.packages_synced,
@@ -245,13 +262,25 @@ fn handleUpdate(
             stats.source_added,
             stats.source_changed_count,
             stats.source_removed,
+            stats.source_repo_cloned,
+            stats.source_repo_updated,
+            stats.source_repo_failed,
         },
     );
     defer allocator.free(body);
 
     std.log.info(
-        "update completed repos={d} synced={d} created={d} source_changed={any} source_packages={d}",
-        .{ stats.repos_scanned, stats.packages_synced, stats.tarballs_created, stats.source_changed, stats.source_packages },
+        "update completed repos={d} synced={d} created={d} source_changed={any} source_packages={d} cloned={d} updated={d} failed={d}",
+        .{
+            stats.repos_scanned,
+            stats.packages_synced,
+            stats.tarballs_created,
+            stats.source_changed,
+            stats.source_packages,
+            stats.source_repo_cloned,
+            stats.source_repo_updated,
+            stats.source_repo_failed,
+        },
     );
     try http.writeHeaders(connection, "200 OK", "application/json", body.len);
     try connection.stream.writeAll(body);

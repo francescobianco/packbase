@@ -15,7 +15,7 @@ services:
       PACKBASE_PORT: "8080"
       PACKBASE_TOKEN: "${PACKBASE_TOKEN}"
     volumes:
-      - packbase-data:/data
+      - ./data:/data
       - ./scripts/create-fixture-repos.sh:/seed/create-fixture-repos.sh:ro
       - ./scripts/seed-packbase-data.sh:/seed/seed-packbase-data.sh:ro
       - ./test/fixtures:/fixtures:ro
@@ -39,6 +39,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  packbase-data:
   caddy-data:
   caddy-config:

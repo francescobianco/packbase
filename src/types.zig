@@ -34,6 +34,7 @@ pub const SourceRecord = struct {
     id: []u8,
     repo_url: []u8,
     package_name: []u8,
+    default_ref: []u8,
 };
 
 pub const SyncStats = struct {
@@ -47,6 +48,9 @@ pub const SyncStats = struct {
     source_added: usize = 0,
     source_changed_count: usize = 0,
     source_removed: usize = 0,
+    source_repo_cloned: usize = 0,
+    source_repo_updated: usize = 0,
+    source_repo_failed: usize = 0,
     rate_limited: bool = false,
     retry_after: i64 = 0,
     queued: bool = false,

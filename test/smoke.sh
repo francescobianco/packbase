@@ -16,19 +16,50 @@ EXPECTED_RELEASE="$(tr -d '\r\n' < "$ROOT_DIR/src/RELEASE_ID")"
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"
 
+SOURCE_FIXTURES_DIR="$TMP_DIR/source-fixtures"
+mkdir -p "$SOURCE_FIXTURES_DIR/remote-only/src"
+
+cat > "$SOURCE_FIXTURES_DIR/remote-only/build.zig" <<'ZIG'
+const std = @import("std");
+pub fn build(_: *std.Build) void {}
+ZIG
+
+cat > "$SOURCE_FIXTURES_DIR/remote-only/build.zig.zon" <<'ZON'
+.{
+    .name = .remote_only_fixture,
+    .version = "0.1.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "README.md",
+        "src",
+    },
+}
+ZON
+
+cat > "$SOURCE_FIXTURES_DIR/remote-only/README.md" <<'MD'
+# remote-only fixture
+
+Source-backed package materialised by `/api/update`.
+MD
+
+cat > "$SOURCE_FIXTURES_DIR/remote-only/src/root.zig" <<'ZIG'
+pub fn message() []const u8 {
+    return "remote-only";
+}
+ZIG
+
 cat > "$TMP_DIR/packbase-source.json" <<'JSON'
 {
   "protocol": "v1",
   "packages": [
     {
-      "id": "seed-hello",
-      "title": "hello",
-      "repository": { "url": "https://example.invalid/hello" }
-    },
-    {
       "id": "seed-remote-only",
       "title": "remote-only",
-      "repository": { "url": "https://example.invalid/remote-only" }
+      "repository": {
+        "url": "file:///tmp/source-repos/git/remote-only.git",
+        "default_ref": "main"
+      }
     }
   ]
 }
@@ -74,10 +105,11 @@ docker run -d \
     -v "$ROOT_DIR/scripts/create-fixture-repos.sh:/seed/create-fixture-repos.sh:ro" \
     -v "$ROOT_DIR/scripts/seed-packbase-data.sh:/seed/seed-packbase-data.sh:ro" \
     -v "$TMP_DIR/packbase-source.json:/source/packbase-source.json:ro" \
+    -v "$SOURCE_FIXTURES_DIR:/source/fixtures:ro" \
     -v "$ROOT_DIR/test/fixtures:/fixtures:ro" \
     --entrypoint /bin/sh \
     "$IMAGE_TAG" \
-    -lc 'sh /seed/seed-packbase-data.sh /var/lib/packbase/public /fixtures && exec /usr/local/bin/packbase' \
+    -lc 'sh /seed/create-fixture-repos.sh /tmp/source-repos/git /source/fixtures && sh /seed/seed-packbase-data.sh /var/lib/packbase/public /fixtures && exec /usr/local/bin/packbase' \
     >/dev/null
 
 for _ in $(seq 1 30); do
@@ -144,12 +176,16 @@ UPDATE_RESP="$(curl -fsS -X POST "http://127.0.0.1:${HOST_PORT}/api/update")"
 printf 'api/update response: %s\n' "$UPDATE_RESP"
 printf '%s' "$UPDATE_RESP" | grep -q '"status":"ok"'
 printf '%s' "$UPDATE_RESP" | grep -q '"tarballs_created":'
+printf '%s' "$UPDATE_RESP" | grep -q '"source_repo_cloned":1'
 
 REPAIRED_LIST_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/list")"
 printf 'repaired api/list response: %s\n' "$REPAIRED_LIST_RESP"
 printf '%s' "$REPAIRED_LIST_RESP" | grep -q '"hello"'
 printf '%s' "$REPAIRED_LIST_RESP" | grep -q '"remote-only"'
 printf '%s' "$REPAIRED_LIST_RESP" | grep -q '"registered_packages":'
+printf '%s' "$REPAIRED_LIST_RESP" | grep -q '"local_packages":'
+
+curl -fsS "http://127.0.0.1:${HOST_PORT}/p/remote-only/tag/v0.1.0.tar.gz" >/dev/null
 
 printf 'api/update: OK\n'
 
@@ -160,6 +196,7 @@ printf 'api/info response: %s\n' "$RELEASE_RESP"
 
 printf '%s' "$RELEASE_RESP" | grep -q "\"release\":\"${EXPECTED_RELEASE}\""
 printf '%s' "$RELEASE_RESP" | grep -q '"service":"packbase"'
+printf '%s' "$RELEASE_RESP" | grep -q '"source_repo_cloned":1'
 
 printf 'api/info: OK\n'
 

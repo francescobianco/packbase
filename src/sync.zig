@@ -124,13 +124,14 @@ pub fn syncPackages(allocator: std.mem.Allocator, root: []const u8) !types.SyncS
     return stats;
 }
 
-pub fn syncSourceIndex(
+pub fn syncSourceCatalog(
     allocator: std.mem.Allocator,
     root: []const u8,
     source_url: []const u8,
     stats: *types.SyncStats,
-) !void {
-    if (source_url.len == 0) return;
+) !std.ArrayList(types.SourceRecord) {
+    const empty = std.ArrayList(types.SourceRecord).empty;
+    if (source_url.len == 0) return empty;
 
     const state_dir = try ensureStateDir(allocator, root);
     defer allocator.free(state_dir);
@@ -143,7 +144,7 @@ pub fn syncSourceIndex(
     const diff_path = try std.fs.path.join(allocator, &.{ state_dir, "source.diff.json" });
     defer allocator.free(diff_path);
 
-    const new_raw = shell.runCommandOutput(allocator, &[_][]const u8{ "curl", "-fsS", source_url }) catch return;
+    const new_raw = shell.runCommandOutput(allocator, &[_][]const u8{ "curl", "-fsS", source_url }) catch return empty;
     defer allocator.free(new_raw);
 
     const old_raw = try readOptionalFileAlloc(allocator, current_path, 16 * 1024 * 1024);
@@ -152,8 +153,7 @@ pub fn syncSourceIndex(
     const changed = if (old_raw) |old| !std.mem.eql(u8, old, new_raw) else true;
     stats.source_changed = changed;
 
-    var new_records = try extractSourceRecords(allocator, new_raw);
-    defer freeSourceRecords(allocator, &new_records);
+    const new_records = try extractSourceRecords(allocator, new_raw);
     stats.source_packages = new_records.items.len;
 
     if (old_raw) |old| {
@@ -170,6 +170,31 @@ pub fn syncSourceIndex(
     if (changed or old_raw == null) try writeTextFile(current_path, new_raw);
     try writeRegisteredSnapshot(allocator, registered_path, new_records.items);
     try writeSourceDiffSnapshot(allocator, diff_path, stats);
+    return new_records;
+}
+
+pub fn syncSourceRepos(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    records: []const types.SourceRecord,
+    refresh_existing: bool,
+    stats: *types.SyncStats,
+) !void {
+    for (records) |record| {
+        if (record.repo_url.len == 0) continue;
+        ensureSourceRepo(allocator, root, record, refresh_existing, stats) catch |err| {
+            stats.source_repo_failed += 1;
+            std.log.warn(
+                "source repo sync failed package={s} url={s} error={s}",
+                .{ record.package_name, record.repo_url, @errorName(err) },
+            );
+            continue;
+        };
+    }
+}
+
+pub fn freeSourceRecordList(allocator: std.mem.Allocator, records: *std.ArrayList(types.SourceRecord)) void {
+    freeSourceRecords(allocator, records);
 }
 
 fn ensureStateDir(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
@@ -191,7 +216,7 @@ fn writeUpdateStatus(
     const status_path = try std.fs.path.join(allocator, &.{ state_dir, "update.status.json" });
     defer allocator.free(status_path);
 
-    const body = try std.fmt.allocPrint(
+    const base_body = try std.fmt.allocPrint(
         allocator,
         "{{\"state\":\"{s}\",\"started_at\":{d},\"updated_at\":{d},\"repos_scanned\":{d},\"packages_synced\":{d},\"tarballs_created\":{d},\"tarballs_present\":{d},\"default_seeded\":{s},\"source_changed\":{s},\"source_packages\":{d},\"source_added\":{d},\"source_updated\":{d},\"source_removed\":{d},\"retry_after\":{d},\"queued\":{s}}}\n",
         .{
@@ -212,6 +237,8 @@ fn writeUpdateStatus(
             if (stats.queued) "true" else "false",
         },
     );
+    defer allocator.free(base_body);
+    const body = try injectRepoSyncStats(allocator, base_body, stats);
     defer allocator.free(body);
     try writeTextFile(status_path, body);
 }
@@ -455,6 +482,10 @@ fn extractSourceRecords(allocator: std.mem.Allocator, raw: []const u8) !std.Arra
             .id = try allocator.dupe(u8, pkg.id),
             .repo_url = repo_url,
             .package_name = package_name,
+            .default_ref = if (pkg.repository) |repo|
+                try allocator.dupe(u8, repo.default_ref orelse "")
+            else
+                try allocator.dupe(u8, ""),
         });
     }
 
@@ -467,6 +498,7 @@ fn freeSourceRecords(allocator: std.mem.Allocator, records: *std.ArrayList(types
         allocator.free(record.id);
         allocator.free(record.repo_url);
         allocator.free(record.package_name);
+        allocator.free(record.default_ref);
     }
     records.deinit(allocator);
 }
@@ -499,7 +531,8 @@ fn computeSourceDiff(old_items: []const types.SourceRecord, new_items: []const t
             },
             .eq => {
                 if (!std.mem.eql(u8, old_items[i].repo_url, new_items[j].repo_url) or
-                    !std.mem.eql(u8, old_items[i].package_name, new_items[j].package_name))
+                    !std.mem.eql(u8, old_items[i].package_name, new_items[j].package_name) or
+                    !std.mem.eql(u8, old_items[i].default_ref, new_items[j].default_ref))
                 {
                     stats.source_changed_count += 1;
                 }
@@ -540,13 +573,16 @@ fn writeRegisteredSnapshot(allocator: std.mem.Allocator, path: []const u8, recor
 fn writeSourceDiffSnapshot(allocator: std.mem.Allocator, path: []const u8, stats: *const types.SyncStats) !void {
     const body = try std.fmt.allocPrint(
         allocator,
-        "{{\"source_changed\":{s},\"source_packages\":{d},\"source_added\":{d},\"source_updated\":{d},\"source_removed\":{d}}}\n",
+        "{{\"source_changed\":{s},\"source_packages\":{d},\"source_added\":{d},\"source_updated\":{d},\"source_removed\":{d},\"source_repo_cloned\":{d},\"source_repo_updated\":{d},\"source_repo_failed\":{d}}}\n",
         .{
             if (stats.source_changed) "true" else "false",
             stats.source_packages,
             stats.source_added,
             stats.source_changed_count,
             stats.source_removed,
+            stats.source_repo_cloned,
+            stats.source_repo_updated,
+            stats.source_repo_failed,
         },
     );
     defer allocator.free(body);
@@ -650,4 +686,69 @@ fn appendJsonString(allocator: std.mem.Allocator, body: *std.ArrayList(u8), valu
         else => try body.append(allocator, ch),
     };
     try body.append(allocator, '"');
+}
+
+fn ensureSourceRepo(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    record: types.SourceRecord,
+    refresh_existing: bool,
+    stats: *types.SyncStats,
+) !void {
+    const git_root = try std.fs.path.join(allocator, &.{ root, "git" });
+    defer allocator.free(git_root);
+    try shell.runCommand(allocator, &[_][]const u8{ "mkdir", "-p", git_root });
+
+    const repo_dir_name = try std.fmt.allocPrint(allocator, "{s}.git", .{record.package_name});
+    defer allocator.free(repo_dir_name);
+    const bare_repo = try std.fs.path.join(allocator, &.{ git_root, repo_dir_name });
+    defer allocator.free(bare_repo);
+
+    const head_path = try std.fs.path.join(allocator, &.{ bare_repo, "HEAD" });
+    defer allocator.free(head_path);
+
+    if (!pathExists(head_path)) {
+        try shell.runCommand(allocator, &[_][]const u8{
+            "git", "-c", "protocol.file.allow=always", "-c", "safe.directory=*",
+            "clone", "--mirror", "--quiet", record.repo_url, bare_repo,
+        });
+        stats.source_repo_cloned += 1;
+    } else if (refresh_existing) {
+        shell.runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "remote", "set-url", "origin", record.repo_url }) catch {};
+        try shell.runCommand(allocator, &[_][]const u8{
+            "git", "-c", "protocol.file.allow=always", "-c", "safe.directory=*",
+            "-C", bare_repo, "fetch", "--prune", "--tags", "origin",
+            "+refs/heads/*:refs/heads/*",
+            "+refs/tags/*:refs/tags/*",
+        });
+        stats.source_repo_updated += 1;
+    } else {
+        return;
+    }
+
+    if (record.default_ref.len != 0) {
+        const head_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{record.default_ref});
+        defer allocator.free(head_ref);
+        shell.runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "symbolic-ref", "HEAD", head_ref }) catch {};
+    }
+    shell.runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "update-server-info" }) catch {};
+}
+
+fn injectRepoSyncStats(allocator: std.mem.Allocator, base_body: []const u8, stats: *const types.SyncStats) ![]u8 {
+    const trimmed = std.mem.trimRight(u8, base_body, "\r\n");
+    if (trimmed.len == 0 or trimmed[trimmed.len - 1] != '}') return allocator.dupe(u8, base_body);
+
+    const suffix = try std.fmt.allocPrint(
+        allocator,
+        ",\"source_repo_cloned\":{d},\"source_repo_updated\":{d},\"source_repo_failed\":{d}}}\n",
+        .{ stats.source_repo_cloned, stats.source_repo_updated, stats.source_repo_failed },
+    );
+    defer allocator.free(suffix);
+
+    return std.mem.concat(allocator, u8, &.{ trimmed[0 .. trimmed.len - 1], suffix });
+}
+
+fn pathExists(path: []const u8) bool {
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
 }

@@ -132,13 +132,19 @@ Restituisce:
 ### `GET /api/info`
 
 Restituisce metadati dell'istanza, incluso l'identificativo di rilascio della
-build servita.
+build servita e lo stato persistito dell'ultima `update`.
 
 **Response `200`**
 ```json
 {
   "service": "packbase",
-  "release": "r0006"
+  "release": "r0007",
+  "update": {
+    "state": "idle",
+    "started_at": 1776183143,
+    "updated_at": 1776183143,
+    "source_packages": 79
+  }
 }
 ```
 
@@ -207,13 +213,13 @@ The smoke test:
 To verify the short Git URL directly, run:
 
 ```bash
-bash test/remote.sh pb.yafb.net hello r0006
+bash test/remote.sh pb.yafb.net hello r0007
 ```
 
 Or:
 
 ```bash
-PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0006 bash test/remote.sh
+PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0007 bash test/remote.sh
 ```
 
 Artefacts survive in `test/tmp/` for inspection after the run.
