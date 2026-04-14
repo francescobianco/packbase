@@ -384,14 +384,11 @@ fn handleSmartHttp(
         repo_rel = repo_rel[0 .. repo_rel.len - 17];
     }
 
-    const repo_dir = try std.fs.path.join(allocator, &.{ root, "git", repo_rel });
-    defer allocator.free(repo_dir);
-
-    var dir = std.fs.cwd().openDir(repo_dir, .{}) catch {
+    const repo_dir = (try resolveRepoDir(allocator, root, repo_rel)) orelse {
         try http.sendSimpleResponse(connection, "404 Not Found", "text/plain", "not found\n");
         return;
     };
-    defer dir.close();
+    defer allocator.free(repo_dir);
 
     if (std.mem.eql(u8, request.method, "GET")) {
         try handleUploadPackAdvertise(allocator, connection, repo_dir, head_only);
@@ -405,6 +402,195 @@ fn handleSmartHttp(
     }
 
     try http.sendSimpleResponse(connection, "404 Not Found", "text/plain", "not found\n");
+}
+
+/// Resolves the git bare-repo directory for a given repo_rel name.
+/// First checks for an existing bare repo in {root}/git/{repo_rel}.
+/// If not found, builds an ephemeral bare repo from tarballs in {root}/p/{pkg}/tag/.
+/// Returns an allocated path (caller must free), or null if the package doesn't exist.
+fn resolveRepoDir(allocator: std.mem.Allocator, root: []const u8, repo_rel: []const u8) !?[]const u8 {
+    const git_dir = try std.fs.path.join(allocator, &.{ root, "git", repo_rel });
+    errdefer allocator.free(git_dir);
+    if (std.fs.cwd().access(git_dir, .{})) |_| {
+        return git_dir;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    allocator.free(git_dir);
+
+    const pkg_name = if (std.mem.endsWith(u8, repo_rel, ".git"))
+        repo_rel[0 .. repo_rel.len - 4]
+    else
+        repo_rel;
+
+    return ensureGitCacheFromTarballs(allocator, root, pkg_name) catch |err| {
+        std.log.warn("git cache unavailable package={s} err={s}", .{ pkg_name, @errorName(err) });
+        return null;
+    };
+}
+
+/// Ensures a cached bare git repo exists for pkg_name, built from its tarballs.
+/// Cache lives at {root}/.packbase/git-cache/{pkg_name} and is rebuilt
+/// whenever the number of tarballs changes.
+fn ensureGitCacheFromTarballs(allocator: std.mem.Allocator, root: []const u8, pkg_name: []const u8) ![]const u8 {
+    const tag_dir = try std.fs.path.join(allocator, &.{ root, "p", pkg_name, "tag" });
+    defer allocator.free(tag_dir);
+
+    var tags = std.ArrayList([]u8).empty;
+    defer {
+        for (tags.items) |t| allocator.free(t);
+        tags.deinit(allocator);
+    }
+
+    {
+        var td = std.fs.openDirAbsolute(tag_dir, .{ .iterate = true }) catch return error.FileNotFound;
+        defer td.close();
+        var iter = td.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".tar.gz")) continue;
+            const tag = entry.name[0 .. entry.name.len - 7];
+            try tags.append(allocator, try allocator.dupe(u8, tag));
+        }
+    }
+
+    if (tags.items.len == 0) return error.FileNotFound;
+
+    std.mem.sort([]u8, tags.items, {}, struct {
+        fn lessThan(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+
+    const cache_dir = try std.fs.path.join(allocator, &.{ root, ".packbase", "git-cache", pkg_name });
+    errdefer allocator.free(cache_dir);
+
+    const needs_rebuild = blk: {
+        const output = shell.runCommandOutput(allocator, &.{ "git", "-C", cache_dir, "tag" }) catch break :blk true;
+        defer allocator.free(output);
+        var count: usize = 0;
+        var lines = std.mem.splitScalar(u8, output, '\n');
+        while (lines.next()) |line| {
+            if (line.len > 0) count += 1;
+        }
+        break :blk count != tags.items.len;
+    };
+
+    if (needs_rebuild) {
+        std.log.info("building git cache package={s} tags={d}", .{ pkg_name, tags.items.len });
+        std.fs.deleteTreeAbsolute(cache_dir) catch {};
+        try buildGitRepoFromTarballs(allocator, tag_dir, tags.items, cache_dir);
+        std.log.info("git cache ready package={s}", .{pkg_name});
+    }
+
+    return cache_dir;
+}
+
+/// Builds a bare git repo at cache_dir with one commit+tag per tarball.
+/// Commits are deterministic: fixed author/committer identity and timestamp.
+fn buildGitRepoFromTarballs(
+    allocator: std.mem.Allocator,
+    tag_dir: []const u8,
+    tags: []const []u8,
+    cache_dir: []const u8,
+) !void {
+    const fixed_env = [_][2][]const u8{
+        .{ "GIT_AUTHOR_NAME", "packbase" },
+        .{ "GIT_AUTHOR_EMAIL", "packbase@localhost" },
+        .{ "GIT_AUTHOR_DATE", "2000-01-01T00:00:00+0000" },
+        .{ "GIT_COMMITTER_NAME", "packbase" },
+        .{ "GIT_COMMITTER_EMAIL", "packbase@localhost" },
+        .{ "GIT_COMMITTER_DATE", "2000-01-01T00:00:00+0000" },
+    };
+
+    const tmp_work = try std.fmt.allocPrint(allocator, "/tmp/pb-gitbuild-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(tmp_work);
+    defer std.fs.deleteTreeAbsolute(tmp_work) catch {};
+
+    try shell.runCommandWithEnv(allocator, &.{ "git", "init", "--quiet", tmp_work }, &fixed_env);
+
+    for (tags, 0..) |tag, i| {
+        if (i > 0) {
+            try shell.runCommandWithEnv(allocator, &.{ "git", "-C", tmp_work, "rm", "-rf", "--cached", "--quiet", "." }, &fixed_env);
+            try cleanWorkDir(allocator, tmp_work);
+        }
+
+        const tarball = try std.fmt.allocPrint(allocator, "{s}/{s}.tar.gz", .{ tag_dir, tag });
+        defer allocator.free(tarball);
+        try extractTarballNormalized(allocator, tarball, tmp_work);
+
+        const msg = try std.fmt.allocPrint(allocator, "release {s}", .{tag});
+        defer allocator.free(msg);
+
+        try shell.runCommandWithEnv(allocator, &.{ "git", "-C", tmp_work, "add", "-A" }, &fixed_env);
+        try shell.runCommandWithEnv(allocator, &.{ "git", "-C", tmp_work, "commit", "--allow-empty", "--quiet", "-m", msg }, &fixed_env);
+        try shell.runCommandWithEnv(allocator, &.{ "git", "-C", tmp_work, "tag", tag }, &fixed_env);
+    }
+
+    const parent = std.fs.path.dirname(cache_dir) orelse return error.InvalidPath;
+    try shell.runCommand(allocator, &.{ "mkdir", "-p", parent });
+    try shell.runCommand(allocator, &.{ "git", "clone", "--bare", "--quiet", tmp_work, cache_dir });
+}
+
+/// Extracts tarball to dest_dir, stripping a single top-level prefix directory
+/// when all entries share the same one (e.g. tarballs created with tar czf dir/).
+fn extractTarballNormalized(allocator: std.mem.Allocator, tarball_path: []const u8, dest_dir: []const u8) !void {
+    const listing = try shell.runCommandOutput(allocator, &.{ "tar", "tzf", tarball_path });
+    defer allocator.free(listing);
+
+    var first: ?[]const u8 = null;
+    var single_prefix = true;
+
+    var lines = std.mem.splitScalar(u8, listing, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        if (trimmed.len == 0) continue;
+        const slash = std.mem.indexOfScalar(u8, trimmed, '/') orelse trimmed.len;
+        const top = trimmed[0..slash];
+        if (top.len == 0) continue;
+        if (first) |f| {
+            if (!std.mem.eql(u8, f, top)) {
+                single_prefix = false;
+                break;
+            }
+        } else {
+            first = top;
+        }
+    }
+
+    if (first != null and single_prefix) {
+        try shell.runCommand(allocator, &.{ "tar", "xzf", tarball_path, "-C", dest_dir, "--strip-components=1" });
+    } else {
+        try shell.runCommand(allocator, &.{ "tar", "xzf", tarball_path, "-C", dest_dir });
+    }
+}
+
+/// Removes all files and directories from dir_path except the .git directory.
+fn cleanWorkDir(allocator: std.mem.Allocator, dir_path: []const u8) !void {
+    var dir = try std.fs.openDirAbsolute(dir_path, .{ .iterate = true });
+    defer dir.close();
+
+    var names = std.ArrayList([]u8).empty;
+    defer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (std.mem.eql(u8, entry.name, ".git")) continue;
+        try names.append(allocator, try allocator.dupe(u8, entry.name));
+    }
+
+    for (names.items) |name| {
+        const full = try std.fs.path.join(allocator, &.{ dir_path, name });
+        defer allocator.free(full);
+        std.fs.deleteTreeAbsolute(full) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
 }
 
 fn handleUploadPackAdvertise(

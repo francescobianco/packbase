@@ -69,3 +69,25 @@ pub fn runCommandOutputAlloc(allocator: std.mem.Allocator, argv: []const []const
     }
     return try out.toOwnedSlice(allocator);
 }
+
+pub fn runCommandWithEnv(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    extra_env: []const [2][]const u8,
+) !void {
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+    for (extra_env) |pair| {
+        try env_map.put(pair[0], pair[1]);
+    }
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Close;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Inherit;
+    child.env_map = &env_map;
+    const term = try child.spawnAndWait();
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
+}

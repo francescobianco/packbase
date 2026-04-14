@@ -2,17 +2,23 @@
 
 ## Overview
 
-Packbase is a self-hosted distribution service for artifacts derived from Git
-repositories. It watches selected upstream references, resolves them to exact
-commits, materializes deterministic snapshots, and serves them over HTTP as
-immutable packages.
+Packbase is a self-hosted mirror for versioned package tarballs distributed via
+a pseudo-Git layer, providing compatibility for package managers like `zig fetch`
+that consume packages through the Git smart HTTP protocol.
 
-Git remains the source of provenance. Packbase becomes the delivery layer.
+**Core idea**: tarballs are the single source of truth. Packbase synthesises a
+Git-compatible interface on top of them so that consumers can use `git+https://`
+URLs without any live Git repository needing to exist on the server.
 
-This model is useful when an ecosystem consumes source code from Git-hosted
-repositories but does not need Git itself at install time. The immediate target
-is Zig, but the design is intentionally generic enough to support other
-Git-based distribution workflows.
+```
+Upstream Git repo → tarball archive → Packbase CDN
+                                           ↓
+                          zig fetch git+https://host/git/pkg
+                                           ↓
+                     synthetic bare repo built on demand from tarball
+                                           ↓
+                          git smart HTTP (upload-pack)
+```
 
 ## Problem
 
@@ -25,22 +31,22 @@ Using public Git for package delivery has recurring operational drawbacks:
 - metadata and caching are inconsistent across providers.
 
 Packbase addresses these issues by converting selected Git refs into stable,
-cacheable, content-addressed artifacts served from infrastructure under local
-control.
+cacheable tarballs and then re-exposing them through a lightweight Git
+compatibility layer that does not depend on the original repository.
 
 ## Goals
 
-- Mirror selected Git refs as deterministic HTTP artifacts.
-- Preserve provenance from ref to resolved commit.
-- Support strong caching and offline serving once artifacts are materialized.
-- Expose a small, stable interface that package managers can consume directly.
-- Keep the first implementation simple enough to ship as a single Zig service.
+- Mirror selected Git refs as deterministic tarballs (`tar.gz`).
+- Serve those tarballs via a pseudo-Git smart HTTP layer.
+- Support `zig fetch git+https://` URLs without requiring a live upstream.
+- Keep the server stateless with respect to Git: no bare repos need to exist
+  on disk; they are built on demand from tarballs and cached.
+- Keep the first implementation simple enough to ship as a single Zig binary.
 
 ## Non-Goals
 
-- Implementing a full Git hosting platform.
-- Serving Git smart protocol endpoints.
-- Mirroring complete repository history by default.
+- Full Git hosting (push, branch management, web UI).
+- Mirroring complete repository history (only tag snapshots are needed).
 - Acting as a general-purpose package registry with search and social features.
 
 ## Core Concepts
@@ -69,14 +75,68 @@ commit, artifact digest, and ecosystem-specific hashes.
 
 ## Product Model
 
-Packbase behaves as a "pseudo-Git distribution layer":
+Packbase behaves as a **pseudo-Git distribution layer**:
 
-- it understands Git concepts such as repository, tag, branch, and commit;
-- it uses Git only to ingest and resolve content;
-- it distributes static artifacts rather than repository history.
+- it understands Git tags to map versions to tarballs;
+- it uses the Git CLI only during ingest (clone/archive) and cache building;
+- it distributes static tarballs as the primary artifact;
+- it emulates the Git smart HTTP protocol so that `zig fetch git+https://`
+  works without any upstream dependency at fetch time.
 
-For consumers, the important contract is not `git clone`, but a stable URL for a
-specific immutable snapshot.
+For consumers, the important contracts are:
+1. `GET /p/{pkg}/tag/{tag}.tar.gz` — direct tarball download;
+2. `git+https://{host}/git/{pkg}` — pseudo-Git endpoint built from tarballs.
+
+## Pseudo-Git Layer (implemented)
+
+This is the core differentiator. When a client issues a Git smart HTTP request
+for a package (`zig fetch git+https://host/git/httpz.zig`), packbase:
+
+1. **Resolves the repo directory** (`resolveRepoDir` in `src/main.zig`):
+   - First checks for a physical bare repo at `{root}/git/{pkg}` (legacy path,
+     kept for compatibility).
+   - If absent, falls through to `ensureGitCacheFromTarballs`.
+
+2. **Builds a synthetic bare repo** (`ensureGitCacheFromTarballs` +
+   `buildGitRepoFromTarballs`):
+   - Scans `{root}/p/{pkg}/tag/*.tar.gz` for available versions.
+   - Sorts tags lexicographically.
+   - For each tag: extracts the tarball into a temp working directory
+     (handling both prefixed and non-prefixed tarballs via
+     `extractTarballNormalized`), then commits with a fixed author identity
+     and timestamp so the resulting git tree is deterministic.
+   - Clones the working repo as a bare repo into
+     `{root}/.packbase/git-cache/{pkg}`.
+   - Cache is reused until the number of tarballs changes (new version
+     published → cache rebuild on next request).
+
+3. **Serves via standard git upload-pack**:
+   - `GET /git/{pkg}/info/refs?service=git-upload-pack` → advertise refs
+   - `POST /git/{pkg}/git-upload-pack` → pack negotiation
+
+Key properties:
+- **Deterministic**: same tarball content always produces the same git tree
+  hash (fixed `GIT_AUTHOR_*` / `GIT_COMMITTER_*` env vars).
+- **No upstream dependency at serve time**: once tarballs are stored, the
+  server needs no network access.
+- **Tarball formats handled**: both `git archive` output (no prefix directory)
+  and `tar czf dir/` output (single top-level prefix) are normalised
+  transparently.
+
+```
+{root}/
+  p/
+    httpz.zig/
+      tag/
+        v0.6.0.tar.gz       ← source of truth
+        v0.7.0.tar.gz
+  .packbase/
+    git-cache/
+      httpz.zig/            ← synthetic bare repo (auto-built, rebuilt on new tags)
+        HEAD
+        packed-refs
+        objects/
+```
 
 ## System Architecture
 
