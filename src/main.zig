@@ -15,6 +15,7 @@ const SyncStats = struct {
     packages_synced: usize = 0,
     tarballs_created: usize = 0,
     tarballs_present: usize = 0,
+    default_seeded: bool = false,
 };
 
 pub fn main() !void {
@@ -255,8 +256,8 @@ fn handleUpdate(
 
     const body = try std.fmt.allocPrint(
         allocator,
-        "{{\"status\":\"ok\",\"repos_scanned\":{d},\"packages_synced\":{d},\"tarballs_created\":{d},\"tarballs_present\":{d}}}\n",
-        .{ stats.repos_scanned, stats.packages_synced, stats.tarballs_created, stats.tarballs_present },
+        "{{\"status\":\"ok\",\"repos_scanned\":{d},\"packages_synced\":{d},\"tarballs_created\":{d},\"tarballs_present\":{d},\"default_seeded\":{s}}}\n",
+        .{ stats.repos_scanned, stats.packages_synced, stats.tarballs_created, stats.tarballs_present, if (stats.default_seeded) "true" else "false" },
     );
     defer allocator.free(body);
 
@@ -318,16 +319,33 @@ fn authorizeRequest(
 }
 
 fn syncPackages(allocator: std.mem.Allocator, root: []const u8) !SyncStats {
+    var stats = SyncStats{};
+
+    try scanAndSyncRepos(allocator, root, &stats);
+    if (stats.repos_scanned != 0) return stats;
+
+    if (try ensureBuiltInHelloSeed(allocator, root)) {
+        stats.default_seeded = true;
+        stats = SyncStats{ .default_seeded = true };
+        try scanAndSyncRepos(allocator, root, &stats);
+    }
+
+    return stats;
+}
+
+fn scanAndSyncRepos(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    stats: *SyncStats,
+) !void {
     const git_root = try std.fs.path.join(allocator, &.{ root, "git" });
     defer allocator.free(git_root);
 
     var dir = std.fs.cwd().openDir(git_root, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return .{},
+        error.FileNotFound => return,
         else => return err,
     };
     defer dir.close();
-
-    var stats = SyncStats{};
     var it = dir.iterate();
     while (try it.next()) |entry| {
         if (entry.kind != .directory) continue;
@@ -335,10 +353,8 @@ fn syncPackages(allocator: std.mem.Allocator, root: []const u8) !SyncStats {
 
         stats.repos_scanned += 1;
         const repo_name = entry.name[0 .. entry.name.len - 4];
-        try syncRepoPackage(allocator, root, entry.name, repo_name, &stats);
+        try syncRepoPackage(allocator, root, entry.name, repo_name, stats);
     }
-
-    return stats;
 }
 
 fn syncRepoPackage(
@@ -428,6 +444,94 @@ fn archiveGitTag(
         .Exited => |code| if (code != 0) return error.CommandFailed,
         else => return error.CommandFailed,
     }
+}
+
+fn ensureBuiltInHelloSeed(allocator: std.mem.Allocator, root: []const u8) !bool {
+    const hello_repo = try std.fs.path.join(allocator, &.{ root, "git", "hello.git", "HEAD" });
+    defer allocator.free(hello_repo);
+    if (std.fs.cwd().access(hello_repo, .{})) |_| return false else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    const tmp_root = try std.fmt.allocPrint(allocator, "/tmp/packbase-seed-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(tmp_root);
+    defer std.fs.deleteTreeAbsolute(tmp_root) catch {};
+
+    const source_root = try std.fs.path.join(allocator, &.{ tmp_root, "hello" });
+    defer allocator.free(source_root);
+    const source_src = try std.fs.path.join(allocator, &.{ source_root, "src" });
+    defer allocator.free(source_src);
+    try runCommand(allocator, &[_][]const u8{ "mkdir", "-p", source_src });
+
+    const build_zig = try std.fs.path.join(allocator, &.{ source_root, "build.zig" });
+    defer allocator.free(build_zig);
+    try writeTextFile(build_zig,
+        \\const std = @import("std");
+        \\pub fn build(_: *std.Build) void {}
+        \\
+    );
+
+    const build_zon = try std.fs.path.join(allocator, &.{ source_root, "build.zig.zon" });
+    defer allocator.free(build_zon);
+    try writeTextFile(build_zon,
+        \\.{
+        \\    .name = .hello_fixture,
+        \\    .version = "0.1.0",
+        \\    .paths = .{
+        \\        "build.zig",
+        \\        "build.zig.zon",
+        \\        "README.md",
+        \\        "src",
+        \\    },
+        \\}
+        \\
+    );
+
+    const readme = try std.fs.path.join(allocator, &.{ source_root, "README.md" });
+    defer allocator.free(readme);
+    try writeTextFile(readme,
+        \\# hello fixture
+        \\
+        \\Built-in seed package for packbase deployments.
+        \\
+    );
+
+    const root_zig = try std.fs.path.join(allocator, &.{ source_src, "root.zig" });
+    defer allocator.free(root_zig);
+    try writeTextFile(root_zig,
+        \\pub fn message() []const u8 {
+        \\    return "hello";
+        \\}
+        \\
+    );
+
+    const bare_repo = try std.fs.path.join(allocator, &.{ root, "git", "hello.git" });
+    defer allocator.free(bare_repo);
+    const git_root = try std.fs.path.join(allocator, &.{ root, "git" });
+    defer allocator.free(git_root);
+    try runCommand(allocator, &[_][]const u8{ "mkdir", "-p", git_root });
+    try runCommand(allocator, &[_][]const u8{ "git", "init", "--bare", bare_repo });
+    try runCommand(allocator, &[_][]const u8{ "git", "init", source_root });
+    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "config", "user.name", "Packbase Seed" });
+    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "config", "user.email", "seed@packbase.local" });
+    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "add", "." });
+    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "commit", "-m", "Initial seed" });
+    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "branch", "-M", "main" });
+    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "tag", "v0.1.0" });
+    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "remote", "add", "origin", bare_repo });
+    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "push", "origin", "main" });
+    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "push", "origin", "v0.1.0" });
+    try runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "symbolic-ref", "HEAD", "refs/heads/main" });
+    try runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "update-server-info" });
+
+    return true;
+}
+
+fn writeTextFile(path: []const u8, content: []const u8) !void {
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(content);
 }
 
 fn listPackagesJson(allocator: std.mem.Allocator, root: []const u8) ![]u8 {

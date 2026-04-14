@@ -133,7 +133,7 @@ build servita.
 ```json
 {
   "service": "packbase",
-  "release": "r0004"
+  "release": "r0005"
 }
 ```
 
@@ -195,13 +195,13 @@ The smoke test:
 To verify the short Git URL directly, run:
 
 ```bash
-bash test/remote.sh pb.yafb.net hello r0004
+bash test/remote.sh pb.yafb.net hello r0005
 ```
 
 Or:
 
 ```bash
-PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0004 bash test/remote.sh
+PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0005 bash test/remote.sh
 ```
 
 Se vuoi che il test remoto provi automaticamente a riparare l'istanza quando il
