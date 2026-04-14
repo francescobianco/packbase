@@ -10,6 +10,7 @@ SCHEME="${PACKBASE_REMOTE_SCHEME:-https}"
 REMOTE_URL="${SCHEME}://${DOMAIN}/${REPO_NAME}"
 TARGET_DIR="$TMP_DIR/remote-clone"
 INFO_URL="${SCHEME}://${DOMAIN}/api/info"
+LIST_URL="${SCHEME}://${DOMAIN}/api/list"
 
 if [ -z "$DOMAIN" ]; then
     printf 'usage: %s <domain> [repo] [expected-release]\n' "${BASH_SOURCE[0]}" >&2
@@ -40,6 +41,20 @@ if [ -n "$EXPECTED_RELEASE" ] && [ "$REMOTE_RELEASE" != "$EXPECTED_RELEASE" ]; t
     printf 'release mismatch: expected %s but remote serves %s\n' "$EXPECTED_RELEASE" "$REMOTE_RELEASE" >&2
     exit 1
 fi
+
+if ! LIST_RESP="$(curl -fsS "$LIST_URL")"; then
+    printf 'remote list endpoint not available: %s\n' "$LIST_URL" >&2
+    printf 'expected a deployed packbase instance exposing /api/list\n' >&2
+    exit 1
+fi
+
+if ! printf '%s' "$LIST_RESP" | grep -q "\"${REPO_NAME}\""; then
+    printf 'package %s not listed by %s\n' "$REPO_NAME" "$LIST_URL" >&2
+    printf 'raw response: %s\n' "$LIST_RESP" >&2
+    exit 1
+fi
+
+printf 'remote package list contains %s\n' "$REPO_NAME"
 
 if ! curl -fsS "${REMOTE_URL}/info/refs" >/dev/null; then
     printf 'remote repository endpoint not available: %s/info/refs\n' "$REMOTE_URL" >&2

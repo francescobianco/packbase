@@ -131,7 +131,7 @@ build servita.
 ```json
 {
   "service": "packbase",
-  "release": "r0001"
+  "release": "r0002"
 }
 ```
 
@@ -173,13 +173,13 @@ The smoke test:
 To verify the short Git URL directly, run:
 
 ```bash
-bash test/remote.sh pb.yafb.net hello r0001
+bash test/remote.sh pb.yafb.net hello r0002
 ```
 
 Or:
 
 ```bash
-PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0001 bash test/remote.sh
+PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0002 bash test/remote.sh
 ```
 
 Artefacts survive in `test/tmp/` for inspection after the run.
