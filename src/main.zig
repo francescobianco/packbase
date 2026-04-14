@@ -6,6 +6,11 @@ const sync = @import("sync.zig");
 
 const release_id_raw = @embedFile("RELEASE_ID");
 
+const UpdateWorkerArgs = struct {
+    root: []u8,
+    source_url: []u8,
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -228,25 +233,71 @@ fn handleUpdate(
         try connection.stream.writeAll(body);
         return;
     }
-    std.log.info("update started source={s}", .{source_url});
-    defer sync.finishUpdateWindow(allocator, root, &stats) catch {};
+    const worker_allocator = std.heap.page_allocator;
+    const args = try worker_allocator.create(UpdateWorkerArgs);
+    errdefer worker_allocator.destroy(args);
+    args.* = .{
+        .root = try worker_allocator.dupe(u8, root),
+        .source_url = try worker_allocator.dupe(u8, source_url),
+    };
+    errdefer worker_allocator.free(args.root);
+    errdefer worker_allocator.free(args.source_url);
+
+    var thread = std.Thread.spawn(.{}, updateWorker, .{args}) catch |err| {
+        worker_allocator.free(args.root);
+        worker_allocator.free(args.source_url);
+        worker_allocator.destroy(args);
+        try sync.finishUpdateWindow(allocator, root, &stats);
+        return err;
+    };
+    thread.detach();
+
+    std.log.info("update started in background source={s}", .{source_url});
+    const body =
+        \\{"status":"started"}
+        \\
+    ;
+    try http.writeHeaders(connection, "200 OK", "application/json", body.len);
+    try connection.stream.writeAll(body);
+}
+
+fn updateWorker(args: *UpdateWorkerArgs) void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    const root = args.root;
+    const source_url = args.source_url;
+    defer {
+        const worker_allocator = std.heap.page_allocator;
+        worker_allocator.free(root);
+        worker_allocator.free(source_url);
+        worker_allocator.destroy(args);
+    }
+
+    var stats = types.SyncStats{};
+    defer sync.finishUpdateWindow(allocator, root, &stats) catch |err| {
+        std.log.warn("finish update window failed: {s}", .{@errorName(err)});
+    };
 
     var source_records = sync.syncSourceCatalog(allocator, root, source_url, &stats) catch |err| {
         std.log.warn("source sync failed: {s}", .{@errorName(err)});
-        try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "source sync failed\n");
         return;
     };
     defer sync.freeSourceRecordList(allocator, &source_records);
 
-    sync.syncSourceRepos(allocator, root, source_records.items, stats.source_changed or stats.source_added != 0 or stats.source_changed_count != 0, &stats) catch |err| {
+    sync.syncSourceRepos(
+        allocator,
+        root,
+        source_records.items,
+        stats.source_changed or stats.source_added != 0 or stats.source_changed_count != 0,
+        &stats,
+    ) catch |err| {
         std.log.warn("source repo materialization failed: {s}", .{@errorName(err)});
-        try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "source repo sync failed\n");
         return;
     };
 
     const local_stats = sync.syncPackages(allocator, root) catch |err| {
         std.log.warn("sync failed: {s}", .{@errorName(err)});
-        try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "sync failed\n");
         return;
     };
     stats.repos_scanned = local_stats.repos_scanned;
@@ -254,27 +305,6 @@ fn handleUpdate(
     stats.tarballs_created = local_stats.tarballs_created;
     stats.tarballs_present = local_stats.tarballs_present;
     stats.default_seeded = local_stats.default_seeded;
-
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "{{\"status\":\"ok\",\"repos_scanned\":{d},\"packages_synced\":{d},\"tarballs_created\":{d},\"tarballs_present\":{d},\"default_seeded\":{s},\"source_changed\":{s},\"source_packages\":{d},\"source_added\":{d},\"source_updated\":{d},\"source_removed\":{d},\"source_repo_cloned\":{d},\"source_repo_updated\":{d},\"source_repo_failed\":{d}}}\n",
-        .{
-            stats.repos_scanned,
-            stats.packages_synced,
-            stats.tarballs_created,
-            stats.tarballs_present,
-            if (stats.default_seeded) "true" else "false",
-            if (stats.source_changed) "true" else "false",
-            stats.source_packages,
-            stats.source_added,
-            stats.source_changed_count,
-            stats.source_removed,
-            stats.source_repo_cloned,
-            stats.source_repo_updated,
-            stats.source_repo_failed,
-        },
-    );
-    defer allocator.free(body);
 
     std.log.info(
         "update completed repos={d} synced={d} created={d} source_changed={any} source_packages={d} cloned={d} updated={d} failed={d}",
@@ -289,8 +319,6 @@ fn handleUpdate(
             stats.source_repo_failed,
         },
     );
-    try http.writeHeaders(connection, "200 OK", "application/json", body.len);
-    try connection.stream.writeAll(body);
 }
 
 fn handleList(

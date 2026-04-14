@@ -1,5 +1,7 @@
 # Issue 03 — `zig fetch git+https://…` fails with `EndOfStream` during ls-refs
 
+Status: completed on April 15, 2026 in release `r0012`
+
 ## Summary
 
 `zig fetch --save git+https://pb.yafb.net/<pkg>` fails at the ref-iteration step:
@@ -177,18 +179,63 @@ data could be cut off.
 **Test**: add `header_up -Transfer-Encoding` in the Caddyfile reverse_proxy directive to
 force passthrough of Content-Length.
 
-## Next steps
+## Resolution
 
-1. Test H1: append `0002` after `git upload-pack` output in `handleUploadPackRequest` for v2.
-2. Test H2: add `flush_interval -1` to the Caddyfile `handle @git` block.
-3. Test H3: inspect raw bytes with `curl --http1.1 https://pb.yafb.net/...` and compare.
-4. Add a minimal Zig HTTP test that replicates what `zig fetch` does, to reproduce locally
-   without needing a full deployment.
+The issue was resolved through a combination of fixes applied and verified live
+on `pb.yafb.net`.
+
+### What actually fixed it
+
+1. Removed the incorrect trailing `0002` response-end packet from the v2
+   `git-upload-pack` command response.
+   That packet was breaking standard Git clients and was not the right fix for
+   Zig.
+
+2. Added explicit Smart HTTP proxy matching for the short pseudo-Git URL form:
+
+   - `/name/info/refs`
+   - `/name/git-upload-pack`
+   - `/name/git-receive-pack`
+
+3. Forced a more stable proxy path for Smart HTTP in Caddy:
+
+   - `flush_interval -1`
+   - upstream transport pinned to HTTP/1.1
+   - upstream keepalive disabled for the Smart HTTP block
+
+4. Updated `make update` / deployment flow so that `caddy` is recreated too,
+   not only `packbase`, ensuring proxy config changes actually reach production.
+
+5. Fixed a server bug in `src/main.zig` where accepted connections were closed
+   with `defer` inside the main `while (true)` loop, causing connection cleanup
+   to be delayed until process exit instead of end-of-request.
+
+### Verified live after the fix
+
+- `curl -H 'Git-Protocol: version=2' https://pb.yafb.net/lscolors/info/refs?service=git-upload-pack` → OK
+- `git ls-remote https://pb.yafb.net/lscolors` → OK
+- `zig fetch --save git+https://pb.yafb.net/lscolors` → OK
+
+Example successful live result:
+
+```text
+info: resolved to commit 4ee1068def0da4bb91147c318b524ce9e357a24e
+```
+
+## Follow-up
+
+While resolving this issue, a separate stability problem was observed in the
+backend logs: intermittent `packbase` panics resulting in connection resets seen
+by Caddy as `502`.
+
+That concern is tracked separately in:
+
+- `docs/issues/04-packbase-crashes-under-proxy-load.md`
 
 ## Status
 
 - [x] Server correctly implements git protocol v2 (GIT_PROTOCOL=version=2 env var)
 - [x] GET /info/refs v2 response verified correct
 - [x] POST ls-refs response verified correct via curl
-- [ ] Root cause of Zig-specific EndOfStream identified
-- [ ] Fix implemented and smoke-tested with `zig fetch --save git+https://pb.yafb.net/lscolors`
+- [x] Root cause of Zig-specific EndOfStream identified
+- [x] Fix implemented and verified live with `zig fetch --save git+https://pb.yafb.net/lscolors`
