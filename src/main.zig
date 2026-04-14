@@ -52,13 +52,16 @@ fn handleConnection(
 
     // Read until we have the complete HTTP headers.
     var total_read: usize = 0;
-    const header_end = blk: while (true) {
+    var header_end: usize = 0;
+    while (header_end == 0) {
         if (total_read >= buffer.len) return error.RequestTooLarge;
         const n = try connection.stream.read(buffer[total_read..]);
         if (n == 0) return;
         total_read += n;
-        if (std.mem.indexOf(u8, buffer[0..total_read], "\r\n\r\n")) |pos| break :blk pos + 4;
-    };
+        if (std.mem.indexOf(u8, buffer[0..total_read], "\r\n\r\n")) |pos| {
+            header_end = pos + 4;
+        }
+    }
 
     // If the request has a body, keep reading until Content-Length bytes are received.
     if (http.findHeader(buffer[0..header_end], "Content-Length")) |cl_str| {
@@ -380,6 +383,8 @@ fn updateWorker(args: *UpdateWorkerArgs) void {
         worker_allocator.free(source_url);
         worker_allocator.destroy(args);
     }
+
+    std.log.info("update begin source={s}", .{source_url});
 
     var stats = types.SyncStats{};
     defer sync.finishUpdateWindow(allocator, root, &stats) catch |err| {

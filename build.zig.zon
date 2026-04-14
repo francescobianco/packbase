@@ -1,0 +1,12 @@
+.{
+    .name = .packbase,
+    .version = "0.15.1",
+    .dependencies = .{
+        .lscolors = .{
+            .url = "git+https://pb.yafb.net/lscolors#4ee1068def0da4bb91147c318b524ce9e357a24e",
+            .hash = "lscolors-0.2.0-7kseuVBiAACKNbobwwoXq3qbHTlxbkaPqnr10QQTiOFr",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0x65c1137d4ba2ac35,
+}
