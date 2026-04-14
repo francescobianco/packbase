@@ -1,0 +1,3 @@
+{$PACKBASE_DOMAIN} {
+    reverse_proxy packbase:8080
+}
