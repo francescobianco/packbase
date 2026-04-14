@@ -155,6 +155,10 @@ pub fn syncSourceCatalog(
 
     const new_records = try extractSourceRecords(allocator, new_raw);
     stats.source_packages = new_records.items.len;
+    std.log.info(
+        "source catalog loaded packages={d} changed={any}",
+        .{ stats.source_packages, changed },
+    );
 
     if (old_raw) |old| {
         if (changed) {
@@ -180,16 +184,20 @@ pub fn syncSourceRepos(
     refresh_existing: bool,
     stats: *types.SyncStats,
 ) !void {
-    for (records) |record| {
+    for (records, 0..) |record, index| {
         if (record.repo_url.len == 0) continue;
-        ensureSourceRepo(allocator, root, record, refresh_existing, stats) catch |err| {
+        const action = ensureSourceRepo(allocator, root, record, refresh_existing, stats) catch |err| {
             stats.source_repo_failed += 1;
             std.log.warn(
-                "source repo sync failed package={s} url={s} error={s}",
-                .{ record.package_name, record.repo_url, @errorName(err) },
+                "source repo [{d}/{d}] failed package={s} url={s} error={s}",
+                .{ index + 1, records.len, record.package_name, record.repo_url, @errorName(err) },
             );
             continue;
         };
+        std.log.info(
+            "source repo [{d}/{d}] package={s} action={s}",
+            .{ index + 1, records.len, record.package_name, @tagName(action) },
+        );
     }
 }
 
@@ -276,11 +284,26 @@ fn scanAndSyncRepos(allocator: std.mem.Allocator, root: []const u8, stats: *type
     };
     defer dir.close();
 
+    var total_repos: usize = 0;
+    {
+        var count_dir = try std.fs.cwd().openDir(git_root, .{ .iterate = true });
+        defer count_dir.close();
+        var count_it = count_dir.iterate();
+        while (try count_it.next()) |entry| {
+            if (entry.kind != .directory) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".git")) continue;
+            total_repos += 1;
+        }
+    }
     var it = dir.iterate();
     while (try it.next()) |entry| {
         if (entry.kind != .directory) continue;
         if (!std.mem.endsWith(u8, entry.name, ".git")) continue;
         stats.repos_scanned += 1;
+        std.log.info(
+            "local repo [{d}/{d}] package={s}",
+            .{ stats.repos_scanned, total_repos, entry.name[0 .. entry.name.len - 4] },
+        );
         try syncRepoPackage(allocator, root, entry.name, entry.name[0 .. entry.name.len - 4], stats);
     }
 }
@@ -305,6 +328,7 @@ fn syncRepoPackage(
         const tag = std.mem.trim(u8, raw_tag, " \t\r");
         if (tag.len == 0) continue;
         saw_tag = true;
+        std.log.info("tarball sync package={s} tag={s}", .{ package_name, tag });
         try ensureRepoTarball(allocator, root, repo_path, package_name, tag, stats);
     }
     if (saw_tag) stats.packages_synced += 1;
@@ -329,6 +353,7 @@ fn ensureRepoTarball(
 
     if (std.fs.cwd().access(tarball_path, .{})) |_| {
         stats.tarballs_present += 1;
+        std.log.info("tarball present package={s} tag={s}", .{ package_name, tag });
         return;
     } else |err| switch (err) {
         error.FileNotFound => {},
@@ -337,6 +362,7 @@ fn ensureRepoTarball(
 
     try archiveGitTag(allocator, repo_path, tag, tarball_path);
     stats.tarballs_created += 1;
+    std.log.info("tarball created package={s} tag={s}", .{ package_name, tag });
 }
 
 fn archiveGitTag(allocator: std.mem.Allocator, repo_path: []const u8, tag: []const u8, tarball_path: []const u8) !void {
@@ -688,13 +714,19 @@ fn appendJsonString(allocator: std.mem.Allocator, body: *std.ArrayList(u8), valu
     try body.append(allocator, '"');
 }
 
+const SourceRepoAction = enum {
+    cloned,
+    updated,
+    skipped,
+};
+
 fn ensureSourceRepo(
     allocator: std.mem.Allocator,
     root: []const u8,
     record: types.SourceRecord,
     refresh_existing: bool,
     stats: *types.SyncStats,
-) !void {
+) !SourceRepoAction {
     const git_root = try std.fs.path.join(allocator, &.{ root, "git" });
     defer allocator.free(git_root);
     try shell.runCommand(allocator, &[_][]const u8{ "mkdir", "-p", git_root });
@@ -713,6 +745,13 @@ fn ensureSourceRepo(
             "clone", "--mirror", "--quiet", record.repo_url, bare_repo,
         });
         stats.source_repo_cloned += 1;
+        if (record.default_ref.len != 0) {
+            const head_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{record.default_ref});
+            defer allocator.free(head_ref);
+            shell.runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "symbolic-ref", "HEAD", head_ref }) catch {};
+        }
+        shell.runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "update-server-info" }) catch {};
+        return .cloned;
     } else if (refresh_existing) {
         shell.runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "remote", "set-url", "origin", record.repo_url }) catch {};
         try shell.runCommand(allocator, &[_][]const u8{
@@ -722,16 +761,16 @@ fn ensureSourceRepo(
             "+refs/tags/*:refs/tags/*",
         });
         stats.source_repo_updated += 1;
+        if (record.default_ref.len != 0) {
+            const head_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{record.default_ref});
+            defer allocator.free(head_ref);
+            shell.runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "symbolic-ref", "HEAD", head_ref }) catch {};
+        }
+        shell.runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "update-server-info" }) catch {};
+        return .updated;
     } else {
-        return;
+        return .skipped;
     }
-
-    if (record.default_ref.len != 0) {
-        const head_ref = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{record.default_ref});
-        defer allocator.free(head_ref);
-        shell.runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "symbolic-ref", "HEAD", head_ref }) catch {};
-    }
-    shell.runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "update-server-info" }) catch {};
 }
 
 fn injectRepoSyncStats(allocator: std.mem.Allocator, base_body: []const u8, stats: *const types.SyncStats) ![]u8 {

@@ -1,5 +1,10 @@
 .PHONY: start test-smoke test-remote
 
+push:
+	@git add .
+	@git commit -m "Update" || true
+	@git push
+
 start:
 	@if [ ! -f .env ]; then \
 		echo "No .env file found — let's create one."; \
