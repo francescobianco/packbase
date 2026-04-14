@@ -16,6 +16,24 @@ EXPECTED_RELEASE="$(tr -d '\r\n' < "$ROOT_DIR/src/RELEASE_ID")"
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR"
 
+cat > "$TMP_DIR/packbase-source.json" <<'JSON'
+{
+  "protocol": "v1",
+  "packages": [
+    {
+      "id": "seed-hello",
+      "title": "hello",
+      "repository": { "url": "https://example.invalid/hello" }
+    },
+    {
+      "id": "seed-remote-only",
+      "title": "remote-only",
+      "repository": { "url": "https://example.invalid/remote-only" }
+    }
+  ]
+}
+JSON
+
 # Keep Zig version in sync with the one used to build the service.
 ZIG_VERSION="$(grep -m1 'ARG ZIG_VERSION=' "$ROOT_DIR/Dockerfile" | cut -d= -f2)"
 
@@ -52,8 +70,10 @@ docker run -d \
     --network "$NETWORK_NAME" \
     -p "${HOST_PORT}:8080" \
     -e "PACKBASE_TOKEN=${API_TOKEN}" \
+    -e "PACKBASE_SOURCE=file:///source/packbase-source.json" \
     -v "$ROOT_DIR/scripts/create-fixture-repos.sh:/seed/create-fixture-repos.sh:ro" \
     -v "$ROOT_DIR/scripts/seed-packbase-data.sh:/seed/seed-packbase-data.sh:ro" \
+    -v "$TMP_DIR/packbase-source.json:/source/packbase-source.json:ro" \
     -v "$ROOT_DIR/test/fixtures:/fixtures:ro" \
     --entrypoint /bin/sh \
     "$IMAGE_TAG" \
@@ -102,6 +122,10 @@ printf 'api/list response: %s\n' "$LIST_RESP"
 
 printf '%s' "$LIST_RESP" | grep -q '"hello"'
 printf '%s' "$LIST_RESP" | grep -q '"serde.zig"'
+if printf '%s' "$LIST_RESP" | grep -q '"remote-only"'; then
+    printf 'remote-only should not appear before /api/update fetches PACKBASE_SOURCE\n' >&2
+    exit 1
+fi
 
 printf 'api/list: OK\n'
 
@@ -115,10 +139,7 @@ if printf '%s' "$BROKEN_LIST_RESP" | grep -q '"hello"'; then
     exit 1
 fi
 
-UPDATE_RESP="$(curl -fsS \
-    -X POST \
-    -H "Authorization: Bearer ${API_TOKEN}" \
-    "http://127.0.0.1:${HOST_PORT}/api/update")"
+UPDATE_RESP="$(curl -fsS -X POST "http://127.0.0.1:${HOST_PORT}/api/update")"
 
 printf 'api/update response: %s\n' "$UPDATE_RESP"
 printf '%s' "$UPDATE_RESP" | grep -q '"status":"ok"'
@@ -127,6 +148,8 @@ printf '%s' "$UPDATE_RESP" | grep -q '"tarballs_created":'
 REPAIRED_LIST_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/list")"
 printf 'repaired api/list response: %s\n' "$REPAIRED_LIST_RESP"
 printf '%s' "$REPAIRED_LIST_RESP" | grep -q '"hello"'
+printf '%s' "$REPAIRED_LIST_RESP" | grep -q '"remote-only"'
+printf '%s' "$REPAIRED_LIST_RESP" | grep -q '"registered_packages":'
 
 printf 'api/update: OK\n'
 

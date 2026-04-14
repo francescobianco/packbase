@@ -12,7 +12,6 @@ TARGET_DIR="$TMP_DIR/remote-clone"
 INFO_URL="${SCHEME}://${DOMAIN}/api/info"
 LIST_URL="${SCHEME}://${DOMAIN}/api/list"
 UPDATE_URL="${SCHEME}://${DOMAIN}/api/update"
-REMOTE_TOKEN="${PACKBASE_REMOTE_TOKEN:-}"
 
 if [ -z "$DOMAIN" ]; then
     printf 'usage: %s <domain> [repo] [expected-release]\n' "${BASH_SOURCE[0]}" >&2
@@ -51,15 +50,16 @@ if ! LIST_RESP="$(curl -fsS "$LIST_URL")"; then
 fi
 
 if ! printf '%s' "$LIST_RESP" | grep -q "\"${REPO_NAME}\""; then
-    if [ -n "$REMOTE_TOKEN" ]; then
-        printf 'package %s missing from list, trying soft sync via /api/update\n' "$REPO_NAME"
-        UPDATE_RESP="$(curl -fsS \
-            -X POST \
-            -H "Authorization: Bearer ${REMOTE_TOKEN}" \
-            "$UPDATE_URL")"
-        printf 'api/update response: %s\n' "$UPDATE_RESP"
-        LIST_RESP="$(curl -fsS "$LIST_URL")"
+    printf 'package %s missing from list, trying soft sync via /api/update\n' "$REPO_NAME"
+    UPDATE_RESP="$(curl -fsS -X POST "$UPDATE_URL")"
+    printf 'api/update response: %s\n' "$UPDATE_RESP"
+
+    RETRY_AFTER="$(printf '%s' "$UPDATE_RESP" | sed -n 's/.*"retry_after":\([0-9][0-9]*\).*/\1/p')"
+    if [ -n "$RETRY_AFTER" ] && [ "$RETRY_AFTER" -gt 0 ]; then
+        sleep "$RETRY_AFTER"
     fi
+
+    LIST_RESP="$(curl -fsS "$LIST_URL")"
 fi
 
 if ! printf '%s' "$LIST_RESP" | grep -q "\"${REPO_NAME}\""; then

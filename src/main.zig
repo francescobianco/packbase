@@ -1,22 +1,10 @@
 const std = @import("std");
+const types = @import("types.zig");
+const http = @import("http_helpers.zig");
+const shell = @import("shell.zig");
+const sync = @import("sync.zig");
+
 const release_id_raw = @embedFile("RELEASE_ID");
-
-const Request = struct {
-    method: []const u8,
-    target: []const u8,
-};
-
-const FetchPayload = struct {
-    url: []const u8,
-};
-
-const SyncStats = struct {
-    repos_scanned: usize = 0,
-    packages_synced: usize = 0,
-    tarballs_created: usize = 0,
-    tarballs_present: usize = 0,
-    default_seeded: bool = false,
-};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -25,7 +13,8 @@ pub fn main() !void {
 
     const root = std.posix.getenv("PACKBASE_ROOT") orelse "public";
     const port_text = std.posix.getenv("PACKBASE_PORT") orelse "8080";
-    const token = std.posix.getenv("PACKBASE_TOKEN"); // null = auth disabled
+    const token = std.posix.getenv("PACKBASE_TOKEN");
+    const source_url = std.posix.getenv("PACKBASE_SOURCE") orelse "https://zub.javanile.org/packbase.json";
     const port = try std.fmt.parseInt(u16, port_text, 10);
 
     const address = try std.net.Address.parseIp("0.0.0.0", port);
@@ -38,7 +27,7 @@ pub fn main() !void {
         var connection = try server.accept();
         defer connection.stream.close();
 
-        handleConnection(allocator, &connection, root, token) catch |err| {
+        handleConnection(allocator, &connection, root, token, source_url) catch |err| {
             std.log.warn("request failed: {s}", .{@errorName(err)});
         };
     }
@@ -49,6 +38,7 @@ fn handleConnection(
     connection: *std.net.Server.Connection,
     root: []const u8,
     token: ?[]const u8,
+    source_url: []const u8,
 ) !void {
     const buffer = try allocator.alloc(u8, 65536);
     defer allocator.free(buffer);
@@ -56,24 +46,23 @@ fn handleConnection(
     if (bytes_read == 0) return;
 
     const raw = buffer[0..bytes_read];
-    const request = try parseRequest(raw);
-    const path = requestPath(request.target);
-
+    const request = try http.parseRequest(raw);
+    const path = http.requestPath(request.target);
     const head_only = std.mem.eql(u8, request.method, "HEAD");
+
     if (std.mem.eql(u8, request.method, "POST")) {
         if (std.mem.eql(u8, path, "/api/fetch")) {
             try handleFetch(allocator, connection, root, token, raw);
             return;
         }
-
         if (std.mem.eql(u8, path, "/api/update")) {
-            try handleUpdate(allocator, connection, root, token, raw);
+            try handleUpdate(allocator, connection, root, source_url);
             return;
         }
     }
 
     if (!std.mem.eql(u8, request.method, "GET") and !head_only) {
-        try sendSimpleResponse(connection, "405 Method Not Allowed", "text/plain", "method not allowed\n");
+        try http.sendSimpleResponse(connection, "405 Method Not Allowed", "text/plain", "method not allowed\n");
         return;
     }
 
@@ -81,30 +70,27 @@ fn handleConnection(
         try handleList(allocator, connection, root, head_only);
         return;
     }
-
     if (std.mem.eql(u8, path, "/api/info")) {
         try handleInfo(allocator, connection, head_only);
         return;
     }
-
     if (std.mem.eql(u8, path, "/")) {
-        try sendLandingPage(connection, head_only);
+        try http.sendLandingPage(connection, head_only);
         return;
     }
 
-    const routed_path = try routePath(allocator, path);
+    const routed_path = try http.routePath(allocator, path);
     defer allocator.free(routed_path);
-
-    const resolved = try resolvePath(allocator, root, routed_path);
+    const resolved = try http.resolvePath(allocator, root, routed_path);
     defer allocator.free(resolved);
 
     var file = std.fs.cwd().openFile(resolved, .{}) catch |err| switch (err) {
         error.FileNotFound => {
-            try sendSimpleResponse(connection, "404 Not Found", "text/plain", "not found\n");
+            try http.sendSimpleResponse(connection, "404 Not Found", "text/plain", "not found\n");
             return;
         },
         error.IsDir => {
-            try sendSimpleResponse(connection, "403 Forbidden", "text/plain", "directory listing disabled\n");
+            try http.sendSimpleResponse(connection, "403 Forbidden", "text/plain", "directory listing disabled\n");
             return;
         },
         else => return err,
@@ -112,7 +98,7 @@ fn handleConnection(
     defer file.close();
 
     const stat = try file.stat();
-    try writeHeaders(connection, "200 OK", contentType(resolved), stat.size);
+    try http.writeHeaders(connection, "200 OK", http.contentType(resolved), stat.size);
     if (head_only) return;
 
     var file_buf: [4096]u8 = undefined;
@@ -132,102 +118,72 @@ fn handleFetch(
 ) !void {
     if (!try authorizeRequest(connection, token, raw)) return;
 
-    // Parse JSON body: {"url": "git+https://..."}
-    const body = findBody(raw);
+    const body = http.findBody(raw);
     if (body.len == 0) {
-        try sendSimpleResponse(connection, "400 Bad Request", "text/plain", "empty body\n");
+        try http.sendSimpleResponse(connection, "400 Bad Request", "text/plain", "empty body\n");
         return;
     }
-    const parsed = std.json.parseFromSlice(FetchPayload, allocator, body, .{}) catch {
-        try sendSimpleResponse(connection, "400 Bad Request", "text/plain", "invalid json\n");
+
+    const parsed = std.json.parseFromSlice(types.FetchPayload, allocator, body, .{}) catch {
+        try http.sendSimpleResponse(connection, "400 Bad Request", "text/plain", "invalid json\n");
         return;
     };
     defer parsed.deinit();
     const url = parsed.value.url;
 
-    // Derive package name: "git+https://github.com/User/serde.zig" -> "serde.zig"
     const http_url = if (std.mem.startsWith(u8, url, "git+")) url[4..] else url;
     const slash_pos = std.mem.lastIndexOfScalar(u8, http_url, '/') orelse 0;
     const raw_name = http_url[slash_pos + 1 ..];
-    const pkg_name = if (std.mem.endsWith(u8, raw_name, ".git"))
-        raw_name[0 .. raw_name.len - 4]
-    else
-        raw_name;
+    const pkg_name = if (std.mem.endsWith(u8, raw_name, ".git")) raw_name[0 .. raw_name.len - 4] else raw_name;
 
-    // Unique temp directory for the clone.
-    const tmp_path = try std.fmt.allocPrint(
-        allocator,
-        "/tmp/packbase-{d}",
-        .{std.time.nanoTimestamp()},
-    );
+    const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/packbase-{d}", .{std.time.nanoTimestamp()});
     defer allocator.free(tmp_path);
     defer std.fs.deleteTreeAbsolute(tmp_path) catch {};
 
-    // Clone the upstream repository.
-    runCommand(allocator, &[_][]const u8{ "git", "clone", "--quiet", http_url, tmp_path }) catch {
-        try sendSimpleResponse(connection, "502 Bad Gateway", "text/plain", "git clone failed\n");
+    shell.runCommand(allocator, &[_][]const u8{ "git", "clone", "--quiet", http_url, tmp_path }) catch {
+        try http.sendSimpleResponse(connection, "502 Bad Gateway", "text/plain", "git clone failed\n");
         return;
     };
 
-    // Resolve the most recent tag.
-    const tag_raw = runCommandOutput(allocator, &[_][]const u8{
+    const tag_raw = shell.runCommandOutput(allocator, &[_][]const u8{
         "git", "-C", tmp_path, "describe", "--tags", "--abbrev=0",
     }) catch {
-        try sendSimpleResponse(connection, "422 Unprocessable Entity", "text/plain", "no tags found\n");
+        try http.sendSimpleResponse(connection, "422 Unprocessable Entity", "text/plain", "no tags found\n");
         return;
     };
     defer allocator.free(tag_raw);
     const tag = std.mem.trim(u8, tag_raw, " \t\r\n");
 
-    // Materialise the tarball at $PACKBASE_ROOT/p/<name>/tag/<tag>.tar.gz
     const pkg_dir = try std.fmt.allocPrint(allocator, "{s}/p/{s}/tag", .{ root, pkg_name });
     defer allocator.free(pkg_dir);
-    // mkdir -p is the most reliable way to create nested absolute dirs.
-    try runCommand(allocator, &[_][]const u8{ "mkdir", "-p", pkg_dir });
+    try shell.runCommand(allocator, &[_][]const u8{ "mkdir", "-p", pkg_dir });
 
     const tarball_path = try std.fmt.allocPrint(allocator, "{s}/{s}.tar.gz", .{ pkg_dir, tag });
     defer allocator.free(tarball_path);
 
-    // Check out the resolved tag into the working tree.
-    runCommand(allocator, &[_][]const u8{
-        "git", "-C", tmp_path, "checkout", "--quiet", tag,
-    }) catch {
-        try sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "checkout failed\n");
+    shell.runCommand(allocator, &[_][]const u8{ "git", "-C", tmp_path, "checkout", "--quiet", tag }) catch {
+        try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "checkout failed\n");
         return;
     };
 
-    // zig fetch expects an archive with a single top-level directory (GitHub
-    // style: repo-tag/).  Creating the tar directly from "." produces a "./"
-    // root entry that confuses Zig's tar parser.  Copy the working tree into a
-    // named staging directory first so the archive contains a proper prefix.
     const stage_path = try std.fmt.allocPrint(allocator, "{s}_stage", .{tmp_path});
     defer allocator.free(stage_path);
     defer std.fs.deleteTreeAbsolute(stage_path) catch {};
 
-    try runCommand(allocator, &[_][]const u8{ "cp", "-r", tmp_path, stage_path });
-    // Drop the .git dir from the staging copy.
+    try shell.runCommand(allocator, &[_][]const u8{ "cp", "-r", tmp_path, stage_path });
     const stage_git = try std.fs.path.join(allocator, &.{ stage_path, ".git" });
     defer allocator.free(stage_git);
     std.fs.deleteTreeAbsolute(stage_git) catch {};
 
     const stage_parent = std.fs.path.dirname(stage_path) orelse "/tmp";
     const stage_base = std.fs.path.basename(stage_path);
-
-    runCommand(allocator, &[_][]const u8{
-        "tar", "czf", tarball_path, "-C", stage_parent, stage_base,
-    }) catch {
-        try sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "archive failed\n");
+    shell.runCommand(allocator, &[_][]const u8{ "tar", "czf", tarball_path, "-C", stage_parent, stage_base }) catch {
+        try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "archive failed\n");
         return;
     };
 
-    // Respond with the local URL where the package is now reachable.
-    const pkg_url = try std.fmt.allocPrint(
-        allocator,
-        "/p/{s}/tag/{s}.tar.gz",
-        .{ pkg_name, tag },
-    );
+    const pkg_url = try std.fmt.allocPrint(allocator, "/p/{s}/tag/{s}.tar.gz", .{ pkg_name, tag });
     defer allocator.free(pkg_url);
-
     const resp_body = try std.fmt.allocPrint(
         allocator,
         "{{\"status\":\"ok\",\"package\":\"{s}\",\"tag\":\"{s}\",\"url\":\"{s}\"}}\n",
@@ -235,7 +191,7 @@ fn handleFetch(
     );
     defer allocator.free(resp_body);
 
-    try writeHeaders(connection, "200 OK", "application/json", resp_body.len);
+    try http.writeHeaders(connection, "200 OK", "application/json", resp_body.len);
     try connection.stream.writeAll(resp_body);
 }
 
@@ -243,25 +199,52 @@ fn handleUpdate(
     allocator: std.mem.Allocator,
     connection: *std.net.Server.Connection,
     root: []const u8,
-    token: ?[]const u8,
-    raw: []const u8,
+    source_url: []const u8,
 ) !void {
-    if (!try authorizeRequest(connection, token, raw)) return;
+    var stats = try sync.beginUpdateWindow(allocator, root);
+    if (stats.queued or stats.rate_limited) {
+        const body = try std.fmt.allocPrint(
+            allocator,
+            "{{\"status\":\"{s}\",\"retry_after\":{d},\"queued\":{s}}}\n",
+            .{
+                if (stats.queued) "queued" else "cooldown",
+                stats.retry_after,
+                if (stats.queued) "true" else "false",
+            },
+        );
+        defer allocator.free(body);
+        try http.writeHeaders(connection, "200 OK", "application/json", body.len);
+        try connection.stream.writeAll(body);
+        return;
+    }
+    defer sync.finishUpdateWindow(allocator, root) catch {};
 
-    const stats = syncPackages(allocator, root) catch |err| {
+    stats = sync.syncPackages(allocator, root) catch |err| {
         std.log.warn("sync failed: {s}", .{@errorName(err)});
-        try sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "sync failed\n");
+        try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "sync failed\n");
         return;
     };
+    try sync.syncSourceIndex(allocator, root, source_url, &stats);
 
     const body = try std.fmt.allocPrint(
         allocator,
-        "{{\"status\":\"ok\",\"repos_scanned\":{d},\"packages_synced\":{d},\"tarballs_created\":{d},\"tarballs_present\":{d},\"default_seeded\":{s}}}\n",
-        .{ stats.repos_scanned, stats.packages_synced, stats.tarballs_created, stats.tarballs_present, if (stats.default_seeded) "true" else "false" },
+        "{{\"status\":\"ok\",\"repos_scanned\":{d},\"packages_synced\":{d},\"tarballs_created\":{d},\"tarballs_present\":{d},\"default_seeded\":{s},\"source_changed\":{s},\"source_packages\":{d},\"source_added\":{d},\"source_updated\":{d},\"source_removed\":{d}}}\n",
+        .{
+            stats.repos_scanned,
+            stats.packages_synced,
+            stats.tarballs_created,
+            stats.tarballs_present,
+            if (stats.default_seeded) "true" else "false",
+            if (stats.source_changed) "true" else "false",
+            stats.source_packages,
+            stats.source_added,
+            stats.source_changed_count,
+            stats.source_removed,
+        },
     );
     defer allocator.free(body);
 
-    try writeHeaders(connection, "200 OK", "application/json", body.len);
+    try http.writeHeaders(connection, "200 OK", "application/json", body.len);
     try connection.stream.writeAll(body);
 }
 
@@ -271,11 +254,11 @@ fn handleList(
     root: []const u8,
     head_only: bool,
 ) !void {
-    const packages = try listPackagesJson(allocator, root);
-    defer allocator.free(packages);
+    const body = try sync.listPackagesJson(allocator, root);
+    defer allocator.free(body);
 
-    try writeHeaders(connection, "200 OK", "application/json", packages.len);
-    if (!head_only) try connection.stream.writeAll(packages);
+    try http.writeHeaders(connection, "200 OK", "application/json", body.len);
+    if (!head_only) try connection.stream.writeAll(body);
 }
 
 fn handleInfo(
@@ -291,11 +274,9 @@ fn handleInfo(
     );
     defer allocator.free(body);
 
-    try writeHeaders(connection, "200 OK", "application/json", body.len);
+    try http.writeHeaders(connection, "200 OK", "application/json", body.len);
     if (!head_only) try connection.stream.writeAll(body);
 }
-
-// ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 fn authorizeRequest(
     connection: *std.net.Server.Connection,
@@ -303,581 +284,15 @@ fn authorizeRequest(
     raw: []const u8,
 ) !bool {
     if (token) |expected| {
-        const auth = findHeader(raw, "Authorization") orelse {
-            try sendSimpleResponse(connection, "401 Unauthorized", "text/plain", "unauthorized\n");
+        const auth = http.findHeader(raw, "Authorization") orelse {
+            try http.sendSimpleResponse(connection, "401 Unauthorized", "text/plain", "unauthorized\n");
             return false;
         };
         const prefix = "Bearer ";
-        if (!std.mem.startsWith(u8, auth, prefix) or
-            !std.mem.eql(u8, auth[prefix.len..], expected))
-        {
-            try sendSimpleResponse(connection, "403 Forbidden", "text/plain", "forbidden\n");
+        if (!std.mem.startsWith(u8, auth, prefix) or !std.mem.eql(u8, auth[prefix.len..], expected)) {
+            try http.sendSimpleResponse(connection, "403 Forbidden", "text/plain", "forbidden\n");
             return false;
         }
     }
     return true;
-}
-
-fn syncPackages(allocator: std.mem.Allocator, root: []const u8) !SyncStats {
-    var stats = SyncStats{};
-
-    try scanAndSyncRepos(allocator, root, &stats);
-    if (stats.repos_scanned != 0) return stats;
-
-    if (try ensureBuiltInHelloSeed(allocator, root)) {
-        stats.default_seeded = true;
-        stats = SyncStats{ .default_seeded = true };
-        try scanAndSyncRepos(allocator, root, &stats);
-    }
-
-    return stats;
-}
-
-fn scanAndSyncRepos(
-    allocator: std.mem.Allocator,
-    root: []const u8,
-    stats: *SyncStats,
-) !void {
-    const git_root = try std.fs.path.join(allocator, &.{ root, "git" });
-    defer allocator.free(git_root);
-
-    var dir = std.fs.cwd().openDir(git_root, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer dir.close();
-    var it = dir.iterate();
-    while (try it.next()) |entry| {
-        if (entry.kind != .directory) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".git")) continue;
-
-        stats.repos_scanned += 1;
-        const repo_name = entry.name[0 .. entry.name.len - 4];
-        try syncRepoPackage(allocator, root, entry.name, repo_name, stats);
-    }
-}
-
-fn syncRepoPackage(
-    allocator: std.mem.Allocator,
-    root: []const u8,
-    repo_dir_name: []const u8,
-    package_name: []const u8,
-    stats: *SyncStats,
-) !void {
-    const repo_path = try std.fs.path.join(allocator, &.{ root, "git", repo_dir_name });
-    defer allocator.free(repo_path);
-
-    try runCommand(allocator, &[_][]const u8{ "git", "-C", repo_path, "update-server-info" });
-
-    const tags_raw = runCommandOutput(allocator, &[_][]const u8{ "git", "-C", repo_path, "tag", "--list" }) catch {
-        return;
-    };
-    defer allocator.free(tags_raw);
-
-    var saw_tag = false;
-    var tags = std.mem.splitScalar(u8, tags_raw, '\n');
-    while (tags.next()) |raw_tag| {
-        const tag = std.mem.trim(u8, raw_tag, " \t\r");
-        if (tag.len == 0) continue;
-        saw_tag = true;
-        try ensureRepoTarball(allocator, root, repo_path, package_name, tag, stats);
-    }
-
-    if (saw_tag) stats.packages_synced += 1;
-}
-
-fn ensureRepoTarball(
-    allocator: std.mem.Allocator,
-    root: []const u8,
-    repo_path: []const u8,
-    package_name: []const u8,
-    tag: []const u8,
-    stats: *SyncStats,
-) !void {
-    const pkg_dir = try std.fs.path.join(allocator, &.{ root, "p", package_name, "tag" });
-    defer allocator.free(pkg_dir);
-    try runCommand(allocator, &[_][]const u8{ "mkdir", "-p", pkg_dir });
-
-    const tarball_name = try std.fmt.allocPrint(allocator, "{s}.tar.gz", .{tag});
-    defer allocator.free(tarball_name);
-    const tarball_path = try std.fs.path.join(allocator, &.{ pkg_dir, tarball_name });
-    defer allocator.free(tarball_path);
-
-    if (std.fs.cwd().access(tarball_path, .{})) |_| {
-        stats.tarballs_present += 1;
-        return;
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    }
-
-    try archiveGitTag(allocator, repo_path, tag, tarball_path);
-    stats.tarballs_created += 1;
-}
-
-fn archiveGitTag(
-    allocator: std.mem.Allocator,
-    repo_path: []const u8,
-    tag: []const u8,
-    tarball_path: []const u8,
-) !void {
-    var file = try std.fs.cwd().createFile(tarball_path, .{ .truncate = true });
-    defer file.close();
-
-    var child = std.process.Child.init(&[_][]const u8{
-        "git", "-C", repo_path, "archive", "--format=tar.gz", tag,
-    }, allocator);
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
-
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = try child.stdout.?.read(&buf);
-        if (n == 0) break;
-        try file.writeAll(buf[0..n]);
-    }
-
-    const term = try child.wait();
-    switch (term) {
-        .Exited => |code| if (code != 0) return error.CommandFailed,
-        else => return error.CommandFailed,
-    }
-}
-
-fn ensureBuiltInHelloSeed(allocator: std.mem.Allocator, root: []const u8) !bool {
-    const hello_repo = try std.fs.path.join(allocator, &.{ root, "git", "hello.git", "HEAD" });
-    defer allocator.free(hello_repo);
-    if (std.fs.cwd().access(hello_repo, .{})) |_| return false else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    }
-
-    const tmp_root = try std.fmt.allocPrint(allocator, "/tmp/packbase-seed-{d}", .{std.time.nanoTimestamp()});
-    defer allocator.free(tmp_root);
-    defer std.fs.deleteTreeAbsolute(tmp_root) catch {};
-
-    const source_root = try std.fs.path.join(allocator, &.{ tmp_root, "hello" });
-    defer allocator.free(source_root);
-    const source_src = try std.fs.path.join(allocator, &.{ source_root, "src" });
-    defer allocator.free(source_src);
-    try runCommand(allocator, &[_][]const u8{ "mkdir", "-p", source_src });
-
-    const build_zig = try std.fs.path.join(allocator, &.{ source_root, "build.zig" });
-    defer allocator.free(build_zig);
-    try writeTextFile(build_zig,
-        \\const std = @import("std");
-        \\pub fn build(_: *std.Build) void {}
-        \\
-    );
-
-    const build_zon = try std.fs.path.join(allocator, &.{ source_root, "build.zig.zon" });
-    defer allocator.free(build_zon);
-    try writeTextFile(build_zon,
-        \\.{
-        \\    .name = .hello_fixture,
-        \\    .version = "0.1.0",
-        \\    .paths = .{
-        \\        "build.zig",
-        \\        "build.zig.zon",
-        \\        "README.md",
-        \\        "src",
-        \\    },
-        \\}
-        \\
-    );
-
-    const readme = try std.fs.path.join(allocator, &.{ source_root, "README.md" });
-    defer allocator.free(readme);
-    try writeTextFile(readme,
-        \\# hello fixture
-        \\
-        \\Built-in seed package for packbase deployments.
-        \\
-    );
-
-    const root_zig = try std.fs.path.join(allocator, &.{ source_src, "root.zig" });
-    defer allocator.free(root_zig);
-    try writeTextFile(root_zig,
-        \\pub fn message() []const u8 {
-        \\    return "hello";
-        \\}
-        \\
-    );
-
-    const bare_repo = try std.fs.path.join(allocator, &.{ root, "git", "hello.git" });
-    defer allocator.free(bare_repo);
-    const git_root = try std.fs.path.join(allocator, &.{ root, "git" });
-    defer allocator.free(git_root);
-    try runCommand(allocator, &[_][]const u8{ "mkdir", "-p", git_root });
-    try runCommand(allocator, &[_][]const u8{ "git", "init", "--bare", bare_repo });
-    try runCommand(allocator, &[_][]const u8{ "git", "init", source_root });
-    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "config", "user.name", "Packbase Seed" });
-    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "config", "user.email", "seed@packbase.local" });
-    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "add", "." });
-    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "commit", "-m", "Initial seed" });
-    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "branch", "-M", "main" });
-    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "tag", "v0.1.0" });
-    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "remote", "add", "origin", bare_repo });
-    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "push", "origin", "main" });
-    try runCommand(allocator, &[_][]const u8{ "git", "-C", source_root, "push", "origin", "v0.1.0" });
-    try runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "symbolic-ref", "HEAD", "refs/heads/main" });
-    try runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "update-server-info" });
-
-    return true;
-}
-
-fn writeTextFile(path: []const u8, content: []const u8) !void {
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(content);
-}
-
-fn listPackagesJson(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    const packages_root = try std.fs.path.join(allocator, &.{ root, "p" });
-    defer allocator.free(packages_root);
-
-    var dir = std.fs.cwd().openDir(packages_root, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return allocator.dupe(u8, "{\"packages\":[]}\n"),
-        else => return err,
-    };
-    defer dir.close();
-
-    var entries = std.ArrayList([]u8).empty;
-    defer {
-        for (entries.items) |entry| allocator.free(entry);
-        entries.deinit(allocator);
-    }
-
-    var it = dir.iterate();
-    while (try it.next()) |entry| {
-        if (entry.kind != .directory) continue;
-        try entries.append(allocator, try allocator.dupe(u8, entry.name));
-    }
-
-    std.mem.sort([]u8, entries.items, {}, sortStringAsc);
-
-    var body = std.ArrayList(u8).empty;
-    defer body.deinit(allocator);
-
-    try body.appendSlice(allocator, "{\"packages\":[");
-    for (entries.items, 0..) |name, index| {
-        if (index != 0) try body.append(allocator, ',');
-        try appendJsonString(allocator, &body, name);
-    }
-    try body.appendSlice(allocator, "]}\n");
-
-    return body.toOwnedSlice(allocator);
-}
-
-fn sortStringAsc(_: void, a: []u8, b: []u8) bool {
-    return std.mem.lessThan(u8, a, b);
-}
-
-fn appendJsonString(
-    allocator: std.mem.Allocator,
-    body: *std.ArrayList(u8),
-    value: []const u8,
-) !void {
-    try body.append(allocator, '"');
-    for (value) |ch| switch (ch) {
-        '"' => try body.appendSlice(allocator, "\\\""),
-        '\\' => try body.appendSlice(allocator, "\\\\"),
-        '\n' => try body.appendSlice(allocator, "\\n"),
-        '\r' => try body.appendSlice(allocator, "\\r"),
-        '\t' => try body.appendSlice(allocator, "\\t"),
-        else => try body.append(allocator, ch),
-    };
-    try body.append(allocator, '"');
-}
-
-fn findHeader(raw: []const u8, name: []const u8) ?[]const u8 {
-    var lines = std.mem.splitSequence(u8, raw, "\r\n");
-    _ = lines.next(); // skip request line
-    while (lines.next()) |line| {
-        if (line.len == 0) break; // empty line ends headers
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const hname = std.mem.trim(u8, line[0..colon], " ");
-        const hvalue = std.mem.trim(u8, line[colon + 1 ..], " ");
-        if (std.ascii.eqlIgnoreCase(hname, name)) return hvalue;
-    }
-    return null;
-}
-
-fn findBody(raw: []const u8) []const u8 {
-    const sep = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return "";
-    return raw[sep + 4 ..];
-}
-
-fn parseRequest(raw: []const u8) !Request {
-    const line_end = std.mem.indexOf(u8, raw, "\r\n") orelse return error.BadRequest;
-    const line = raw[0..line_end];
-    var parts = std.mem.splitScalar(u8, line, ' ');
-    const method = parts.next() orelse return error.BadRequest;
-    const target = parts.next() orelse return error.BadRequest;
-    _ = parts.next() orelse return error.BadRequest;
-    return .{ .method = method, .target = target };
-}
-
-fn requestPath(target: []const u8) []const u8 {
-    const q = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
-    return target[0..q];
-}
-
-fn routePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (path.len < 2 or path[0] != '/') return allocator.dupe(u8, path);
-
-    const first_end = std.mem.indexOfScalarPos(u8, path, 1, '/') orelse path.len;
-    const repo_name = path[1..first_end];
-    if (repo_name.len == 0) return allocator.dupe(u8, path);
-
-    if (std.mem.eql(u8, repo_name, "api") or
-        std.mem.eql(u8, repo_name, "git") or
-        std.mem.eql(u8, repo_name, "p"))
-    {
-        return allocator.dupe(u8, path);
-    }
-
-    if (std.mem.endsWith(u8, repo_name, ".git")) return allocator.dupe(u8, path);
-
-    const remainder = path[first_end..];
-    return std.fmt.allocPrint(allocator, "/git/{s}.git{s}", .{ repo_name, remainder });
-}
-
-fn resolvePath(allocator: std.mem.Allocator, root: []const u8, raw_path: []const u8) ![]u8 {
-    if (raw_path.len == 0 or raw_path[0] != '/') return error.BadRequest;
-
-    var parts = std.ArrayList([]const u8).empty;
-    defer parts.deinit(allocator);
-
-    try parts.append(allocator, root);
-
-    var it = std.mem.splitScalar(u8, raw_path[1..], '/');
-    while (it.next()) |part| {
-        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
-        if (std.mem.eql(u8, part, "..")) return error.BadPath;
-        try parts.append(allocator, part);
-    }
-
-    return std.fs.path.join(allocator, parts.items);
-}
-
-fn writeHeaders(
-    connection: *std.net.Server.Connection,
-    status: []const u8,
-    mime: []const u8,
-    size: u64,
-) !void {
-    var buf: [512]u8 = undefined;
-    const resp = try std.fmt.bufPrint(
-        &buf,
-        "HTTP/1.1 {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\nConnection: close\r\n\r\n",
-        .{ status, size, mime },
-    );
-    try connection.stream.writeAll(resp);
-}
-
-fn sendSimpleResponse(
-    connection: *std.net.Server.Connection,
-    status: []const u8,
-    mime: []const u8,
-    body: []const u8,
-) !void {
-    var buf: [512]u8 = undefined;
-    const resp = try std.fmt.bufPrint(
-        &buf,
-        "HTTP/1.1 {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\nConnection: close\r\n\r\n{s}",
-        .{ status, body.len, mime, body },
-    );
-    try connection.stream.writeAll(resp);
-}
-
-fn sendLandingPage(connection: *std.net.Server.Connection, head_only: bool) !void {
-    const body =
-        \\<!DOCTYPE html>
-        \\<html lang="en">
-        \\<head>
-        \\  <meta charset="UTF-8">
-        \\  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        \\  <title>packbase</title>
-        \\  <style>
-        \\    * { box-sizing: border-box; margin: 0; padding: 0; }
-        \\    body {
-        \\      font-family: "DejaVu Sans Mono", "Courier New", monospace;
-        \\      background: #f5f5f5;
-        \\      color: #222;
-        \\      min-height: 100vh;
-        \\    }
-        \\    header {
-        \\      background: #a23;
-        \\      color: #fff;
-        \\      padding: 0.6rem 1.2rem;
-        \\      font-size: 0.95rem;
-        \\      letter-spacing: 0.02em;
-        \\    }
-        \\    header span { opacity: 0.75; margin-left: 1.5rem; }
-        \\    main {
-        \\      max-width: 860px;
-        \\      margin: 2.5rem auto;
-        \\      padding: 0 1rem;
-        \\    }
-        \\    h1 { font-size: 1.5rem; margin-bottom: 0.3rem; }
-        \\    .subtitle { color: #555; font-size: 0.9rem; margin-bottom: 2rem; }
-        \\    table {
-        \\      width: 100%;
-        \\      border-collapse: collapse;
-        \\      background: #fff;
-        \\      border: 1px solid #ddd;
-        \\      font-size: 0.9rem;
-        \\    }
-        \\    th {
-        \\      background: #e8e8e8;
-        \\      text-align: left;
-        \\      padding: 0.5rem 0.8rem;
-        \\      border-bottom: 1px solid #ccc;
-        \\      font-weight: bold;
-        \\    }
-        \\    td { padding: 0.5rem 0.8rem; border-bottom: 1px solid #eee; vertical-align: top; }
-        \\    tr:last-child td { border-bottom: none; }
-        \\    code {
-        \\      background: #f0f0f0;
-        \\      padding: 0.15rem 0.4rem;
-        \\      border-radius: 3px;
-        \\      font-size: 0.85rem;
-        \\    }
-        \\    .method {
-        \\      display: inline-block;
-        \\      padding: 0.1rem 0.45rem;
-        \\      border-radius: 3px;
-        \\      font-size: 0.78rem;
-        \\      font-weight: bold;
-        \\      letter-spacing: 0.04em;
-        \\    }
-        \\    .get  { background: #d4edda; color: #155724; }
-        \\    .post { background: #cce5ff; color: #004085; }
-        \\    footer {
-        \\      text-align: center;
-        \\      color: #999;
-        \\      font-size: 0.8rem;
-        \\      margin: 3rem 0 1.5rem;
-        \\    }
-        \\    footer a { color: #a23; text-decoration: none; }
-        \\    footer a:hover { text-decoration: underline; }
-        \\  </style>
-        \\</head>
-        \\<body>
-        \\  <header>
-        \\    packbase
-        \\    <span>self-hosted Zig package registry</span>
-        \\  </header>
-        \\  <main>
-        \\    <h1>packbase</h1>
-        \\    <p class="subtitle">
-        \\      This server mirrors upstream Git repositories and serves deterministic
-        \\      tarballs so that <code>zig fetch</code> never has to reach GitHub at
-        \\      install time.
-        \\    </p>
-        \\    <table>
-        \\      <thead>
-        \\        <tr><th>Method</th><th>Endpoint</th><th>Description</th></tr>
-        \\      </thead>
-        \\      <tbody>
-        \\        <tr>
-        \\          <td><span class="method post">POST</span></td>
-        \\          <td><code>/api/fetch</code></td>
-        \\          <td>
-        \\            Mirror an upstream Git repository.<br>
-        \\            Requires <code>Authorization: Bearer &lt;token&gt;</code> and JSON body
-        \\            <code>{"url":"git+https://&#8230;"}</code>.
-        \\          </td>
-        \\        </tr>
-        \\        <tr>
-        \\          <td><span class="method get">GET</span></td>
-        \\          <td><code>/p/&lt;pkg&gt;/tag/&lt;tag&gt;.tar.gz</code></td>
-        \\          <td>Download a mirrored tarball for <code>zig fetch --save</code>.</td>
-        \\        </tr>
-        \\        <tr>
-        \\          <td><span class="method get">GET</span></td>
-        \\          <td><code>/api/list</code></td>
-        \\          <td>Return the list of mirrored packages currently available on this instance.</td>
-        \\        </tr>
-        \\        <tr>
-        \\          <td><span class="method post">POST</span></td>
-        \\          <td><code>/api/update</code></td>
-        \\          <td>Soft-sync package tarballs from hosted Git repositories and repair internal state.</td>
-        \\        </tr>
-        \\        <tr>
-        \\          <td><span class="method get">GET</span></td>
-        \\          <td><code>/api/info</code></td>
-        \\          <td>Return service metadata including the release identifier served by this instance.</td>
-        \\        </tr>
-        \\        <tr>
-        \\          <td><span class="method get">GET</span></td>
-        \\          <td><code>/git/&lt;repo&gt;.git/&#8230;</code></td>
-        \\          <td>Dumb-HTTP Git endpoint for fixture repositories.</td>
-        \\        </tr>
-        \\        <tr>
-        \\          <td><span class="method get">GET</span></td>
-        \\          <td><code>/&lt;repo&gt;/&#8230;</code></td>
-        \\          <td>Alias for cloning hosted repositories without the <code>/git</code> prefix.</td>
-        \\        </tr>
-        \\      </tbody>
-        \\    </table>
-        \\  </main>
-        \\  <footer>
-        \\    <a href="https://github.com/francescobianco/packbase">github.com/francescobianco/packbase</a>
-        \\  </footer>
-        \\</body>
-        \\</html>
-    ;
-    try writeHeaders(connection, "200 OK", "text/html; charset=utf-8", body.len);
-    if (!head_only) try connection.stream.writeAll(body);
-}
-
-fn contentType(path: []const u8) []const u8 {
-    if (std.mem.endsWith(u8, path, ".txt")) return "text/plain; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".md")) return "text/markdown; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".json")) return "application/json";
-    if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".tar.gz")) return "application/gzip";
-    return "application/octet-stream";
-}
-
-// ── Child process helpers ─────────────────────────────────────────────────────
-
-fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
-    var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Inherit;
-    const term = try child.spawnAndWait();
-    switch (term) {
-        .Exited => |code| if (code != 0) return error.CommandFailed,
-        else => return error.CommandFailed,
-    }
-}
-
-fn runCommandOutput(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
-    var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
-
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    var tmp: [4096]u8 = undefined;
-    while (true) {
-        const n = try child.stdout.?.read(&tmp);
-        if (n == 0) break;
-        try out.appendSlice(allocator, tmp[0..n]);
-    }
-
-    const term = try child.wait();
-    switch (term) {
-        .Exited => |code| if (code != 0) return error.CommandFailed,
-        else => return error.CommandFailed,
-    }
-    return try out.toOwnedSlice(allocator);
 }

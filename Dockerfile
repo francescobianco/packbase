@@ -18,7 +18,7 @@ RUN cp zig-out/bin/packbase /out/packbase
 
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates git
+RUN apk add --no-cache ca-certificates curl git
 
 COPY --from=build /out/packbase /usr/local/bin/packbase
 RUN mkdir -p /var/lib/packbase/public

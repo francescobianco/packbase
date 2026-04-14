@@ -115,12 +115,17 @@ Download a previously mirrored tarball.
 
 ### `GET /api/list`
 
-Restituisce i pacchetti attualmente disponibili nell'istanza packbase.
+Restituisce:
+- `packages`: unione dei pacchetti locali e di quelli registrati tramite `PACKBASE_SOURCE`
+- `local_packages`: pacchetti realmente materializzati nell'istanza
+- `registered_packages`: pacchetti presenti nell'ultimo snapshot sincronizzato del source remoto
 
 **Response `200`**
 ```json
 {
-  "packages": ["hello", "serde.zig"]
+  "packages": ["hello", "remote-only", "serde.zig"],
+  "local_packages": ["hello", "serde.zig"],
+  "registered_packages": ["hello", "remote-only"]
 }
 ```
 
@@ -133,18 +138,20 @@ build servita.
 ```json
 {
   "service": "packbase",
-  "release": "r0005"
+  "release": "r0006"
 }
 ```
 
 ### `POST /api/update`
 
-Riallinea in modo soft lo stato interno usando i repository ospitati sotto
-`/git` come sorgente di verità. Rigenera i tarball mancanti sotto `/p`,
-aggiorna `update-server-info` e ripara un'istanza parzialmente incoerente.
+Riallinea in modo soft lo stato interno in modo pubblico e idempotente:
+- usa i repository ospitati sotto `/git` come sorgente di verità locale
+- rigenera i tarball mancanti sotto `/p`
+- aggiorna `update-server-info`
+- scarica `PACKBASE_SOURCE`, conserva lo snapshot locale, calcola un diff con lo snapshot precedente e aggiorna la lista dei pacchetti registrati
+- applica un cooldown per evitare carico eccessivo quando viene chiamata ripetutamente
 
-Quando `PACKBASE_TOKEN` è impostato richiede:
-- `Authorization: Bearer <token>`
+L'endpoint è pubblico e non richiede token.
 
 **Response `200`**
 ```json
@@ -153,7 +160,12 @@ Quando `PACKBASE_TOKEN` è impostato richiede:
   "repos_scanned": 1,
   "packages_synced": 1,
   "tarballs_created": 1,
-  "tarballs_present": 0
+  "tarballs_present": 0,
+  "source_changed": true,
+  "source_packages": 2,
+  "source_added": 2,
+  "source_updated": 0,
+  "source_removed": 0
 }
 ```
 
@@ -195,23 +207,13 @@ The smoke test:
 To verify the short Git URL directly, run:
 
 ```bash
-bash test/remote.sh pb.yafb.net hello r0005
+bash test/remote.sh pb.yafb.net hello r0006
 ```
 
 Or:
 
 ```bash
-PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0005 bash test/remote.sh
-```
-
-Se vuoi che il test remoto provi automaticamente a riparare l'istanza quando il
-pacchetto manca in `/api/list`, passa anche il token:
-
-```bash
-PACKBASE_REMOTE_DOMAIN=pb.yafb.net \
-PACKBASE_EXPECTED_RELEASE=r0004 \
-PACKBASE_REMOTE_TOKEN=... \
-bash test/remote.sh
+PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0006 bash test/remote.sh
 ```
 
 Artefacts survive in `test/tmp/` for inspection after the run.
