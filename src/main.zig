@@ -40,6 +40,56 @@ pub fn main() !void {
     }
 }
 
+/// Reads a chunked-encoded HTTP/1.1 request body from `connection` into `buffer`
+/// starting at `header_end`, then decodes the chunks in-place.
+/// Returns the new total_read value (header_end + decoded body length).
+///
+/// The source (chunked framing) always lies ahead of the write cursor, so the
+/// in-place `copyForwards` is safe without extra allocation.
+fn readChunkedBody(
+    connection: *std.net.Server.Connection,
+    buffer: []u8,
+    header_end: usize,
+    total_read_init: usize,
+) !usize {
+    var total_read = total_read_init;
+    var write_pos: usize = header_end; // decoded bytes land here
+    var read_pos: usize = header_end; // next unprocessed byte of raw chunked data
+
+    while (true) {
+        // Ensure we have the chunk-size line (terminated by \r\n).
+        while (std.mem.indexOf(u8, buffer[read_pos..total_read], "\r\n") == null) {
+            if (total_read >= buffer.len) return error.RequestTooLarge;
+            const n = try connection.stream.read(buffer[total_read..]);
+            if (n == 0) return error.UnexpectedEof;
+            total_read += n;
+        }
+
+        const crlf = std.mem.indexOf(u8, buffer[read_pos..total_read], "\r\n").?;
+        const size_str = std.mem.trim(u8, buffer[read_pos .. read_pos + crlf], " ");
+        const chunk_size = std.fmt.parseInt(usize, size_str, 16) catch return error.InvalidChunkedEncoding;
+        read_pos += crlf + 2; // skip size-line and its CRLF
+
+        if (chunk_size == 0) break; // terminal chunk
+
+        // Ensure we have the full chunk data plus its trailing CRLF.
+        while (total_read - read_pos < chunk_size + 2) {
+            if (total_read >= buffer.len) return error.RequestTooLarge;
+            const n = try connection.stream.read(buffer[total_read..]);
+            if (n == 0) return error.UnexpectedEof;
+            total_read += n;
+        }
+
+        // Copy chunk data to write_pos. read_pos is always ahead of write_pos by
+        // at least the chunk-size line overhead, so copyForwards is safe.
+        std.mem.copyForwards(u8, buffer[write_pos..][0..chunk_size], buffer[read_pos..][0..chunk_size]);
+        write_pos += chunk_size;
+        read_pos += chunk_size + 2; // skip data and trailing CRLF
+    }
+
+    return write_pos;
+}
+
 fn handleConnection(
     allocator: std.mem.Allocator,
     connection: *std.net.Server.Connection,
@@ -63,7 +113,10 @@ fn handleConnection(
         }
     }
 
-    // If the request has a body, keep reading until Content-Length bytes are received.
+    // Read the request body according to the transfer encoding.
+    const te_header = http.findHeader(buffer[0..header_end], "Transfer-Encoding");
+    const is_chunked = if (te_header) |te| std.ascii.eqlIgnoreCase(std.mem.trim(u8, te, " "), "chunked") else false;
+
     if (http.findHeader(buffer[0..header_end], "Content-Length")) |cl_str| {
         const content_length = std.fmt.parseInt(usize, std.mem.trim(u8, cl_str, " "), 10) catch 0;
         const needed = header_end + content_length;
@@ -73,12 +126,26 @@ fn handleConnection(
             if (n == 0) return error.UnexpectedEof;
             total_read += n;
         }
+    } else if (is_chunked) {
+        total_read = try readChunkedBody(connection, buffer, header_end, total_read);
     }
 
     const raw = buffer[0..total_read];
     const request = try http.parseRequest(raw);
     const path = http.requestPath(request.target);
     const head_only = std.mem.eql(u8, request.method, "HEAD");
+
+    // Request dump: always logged so unexpected client behaviour is visible in container logs.
+    std.log.info(
+        "request method={s} path={s} te={s} cl={s} body_bytes={d}",
+        .{
+            request.method,
+            path,
+            te_header orelse "-",
+            http.findHeader(raw, "Content-Length") orelse "-",
+            total_read - header_end,
+        },
+    );
 
     if (std.mem.eql(u8, request.method, "POST")) {
         if (std.mem.eql(u8, path, "/api/fetch")) {
