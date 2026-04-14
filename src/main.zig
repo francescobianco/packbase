@@ -79,6 +79,13 @@ fn handleConnection(
         return;
     }
 
+    if (std.mem.eql(u8, request.method, "GET") or std.mem.eql(u8, request.method, "POST")) {
+        if (http.isSmartHttpRequest(path)) {
+            try handleSmartHttp(allocator, connection, root, request, raw, head_only);
+            return;
+        }
+    }
+
     const routed_path = try http.routePath(allocator, path);
     defer allocator.free(routed_path);
     const resolved = try http.resolvePath(allocator, root, routed_path);
@@ -336,4 +343,126 @@ fn authorizeRequest(
         }
     }
     return true;
+}
+
+fn handleSmartHttp(
+    allocator: std.mem.Allocator,
+    connection: *std.net.Server.Connection,
+    root: []const u8,
+    request: types.Request,
+    raw: []const u8,
+    head_only: bool,
+) !void {
+    const path = http.requestPath(request.target);
+    const routed = try http.routePath(allocator, path);
+    defer allocator.free(routed);
+
+    if (std.mem.startsWith(u8, routed, "/git/")) {
+        const after_git = routed[5..];
+        const question = std.mem.indexOfScalar(u8, after_git, '?') orelse after_git.len;
+        var repo_rel = after_git[0..question];
+        if (std.mem.endsWith(u8, repo_rel, "/info/refs")) {
+            repo_rel = repo_rel[0 .. repo_rel.len - 10];
+        } else if (std.mem.endsWith(u8, repo_rel, "/git-upload-pack")) {
+            repo_rel = repo_rel[0 .. repo_rel.len - 15];
+        } else if (std.mem.endsWith(u8, repo_rel, "/git-receive-pack")) {
+            repo_rel = repo_rel[0 .. repo_rel.len - 17];
+        }
+
+        const repo_dir = try std.fs.path.join(allocator, &.{ root, "git", repo_rel });
+        defer allocator.free(repo_dir);
+
+        var dir = std.fs.cwd().openDir(repo_dir, .{}) catch {
+            try http.sendSimpleResponse(connection, "404 Not Found", "text/plain", "not found\n");
+            return;
+        };
+        defer dir.close();
+
+        if (std.mem.eql(u8, request.method, "GET")) {
+            try handleUploadPackAdvertise(allocator, connection, repo_dir, head_only);
+            return;
+        } else if (std.mem.eql(u8, request.method, "POST")) {
+            const content_type = http.findHeader(raw, "Content-Type") orelse "";
+            if (std.mem.eql(u8, content_type, "application/x-git-upload-pack-request")) {
+                try handleUploadPackRequest(allocator, connection, repo_dir, raw, head_only);
+                return;
+            }
+        }
+
+        try http.sendSimpleResponse(connection, "404 Not Found", "text/plain", "not found\n");
+        return;
+    }
+
+    try http.sendSimpleResponse(connection, "400 Bad Request", "text/plain", "invalid request\n");
+}
+
+fn handleUploadPackAdvertise(
+    allocator: std.mem.Allocator,
+    connection: *std.net.Server.Connection,
+    repo_dir: []const u8,
+    head_only: bool,
+) !void {
+    const output = shell.runCommandOutput(allocator, &[_][]const u8{
+        "git", "upload-pack", "--stateless-rpc", "--advertise-refs", repo_dir,
+    }) catch {
+        try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "upload-pack failed\n");
+        return;
+    };
+    defer allocator.free(output);
+
+    const body_len = output.len + 4;
+    var headers: [128]u8 = undefined;
+    const resp = try std.fmt.bufPrint(
+        &headers,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{body_len},
+    );
+    try connection.stream.writeAll(resp);
+    if (!head_only) {
+        try connection.stream.writeAll("001e# service=git-upload-pack\n");
+        try connection.stream.writeAll("0000");
+        try connection.stream.writeAll(output);
+    }
+}
+
+fn handleUploadPackRequest(
+    allocator: std.mem.Allocator,
+    connection: *std.net.Server.Connection,
+    repo_dir: []const u8,
+    raw: []const u8,
+    head_only: bool,
+) !void {
+    const body = http.findBody(raw);
+    const tmp_input = try std.fs.path.join(allocator, &.{ "/tmp", try std.fmt.allocPrint(allocator, "gitreq-{d}", .{std.time.nanoTimestamp()}) });
+    defer {
+        allocator.free(tmp_input);
+        std.fs.deleteTreeAbsolute(tmp_input) catch {};
+    }
+
+    {
+        var file = try std.fs.createFileAbsolute(tmp_input, .{});
+        defer file.close();
+        try file.writeAll(body);
+    }
+
+    const output = shell.runCommandOutputAlloc(allocator, &[_][]const u8{
+        "git", "upload-pack", "--stateless-rpc", repo_dir,
+    }, tmp_input) catch {
+        try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "upload-pack failed\n");
+        return;
+    };
+    defer allocator.free(output);
+
+    const body_len = output.len;
+    var headers: [128]u8 = undefined;
+    const resp = try std.fmt.bufPrint(
+        &headers,
+        "HTTP/1.1 200 OK\r\nContent-Type: " ++
+            "application/x-git-upload-pack-result\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{body_len},
+    );
+    try connection.stream.writeAll(resp);
+    if (!head_only) {
+        try connection.stream.writeAll(output);
+    }
 }

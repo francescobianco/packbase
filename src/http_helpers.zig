@@ -34,6 +34,19 @@ pub fn requestPath(target: []const u8) []const u8 {
     return target[0..q];
 }
 
+pub fn queryParam(target: []const u8, name: []const u8) ?[]const u8 {
+    const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
+    const query = target[q + 1 ..];
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (std.mem.eql(u8, pair, name)) return "";
+        if (std.mem.startsWith(u8, pair, name)) {
+            if (pair[name.len] == '=') return pair[name.len + 1 ..];
+        }
+    }
+    return null;
+}
+
 pub fn routePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (path.len < 2 or path[0] != '/') return allocator.dupe(u8, path);
 
@@ -109,6 +122,19 @@ pub fn contentType(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".tar.gz")) return "application/gzip";
     return "application/octet-stream";
+}
+
+pub fn isSmartHttpRequest(path: []const u8) bool {
+    if (std.mem.startsWith(u8, path, "/git/")) return true;
+    if (std.mem.containsAtLeast(u8, path, 1, "/") and !std.mem.containsAtLeast(u8, path, 2, "/")) return false;
+    const end = std.mem.indexOfScalar(u8, path[1..], '/') orelse return false;
+    const repo_part = path[1..][0..end];
+    if (std.mem.endsWith(u8, repo_part, ".git")) return true;
+    if (std.mem.containsAtLeast(u8, path, 2, "/")) {
+        const remainder = path[1..][end..];
+        return std.mem.eql(u8, remainder, "/info/refs") or std.mem.eql(u8, remainder, "/git-upload-pack") or std.mem.eql(u8, remainder, "/git-receive-pack");
+    }
+    return false;
 }
 
 pub fn sendLandingPage(connection: *std.net.Server.Connection, head_only: bool) !void {
