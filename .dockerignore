@@ -1,0 +1,4 @@
+.git
+.idea
+.zig-cache
+zig-out
