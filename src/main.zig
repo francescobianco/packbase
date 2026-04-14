@@ -366,8 +366,8 @@ fn handleSmartHttp(
         repo_rel = after_git[0..question];
     } else if (http.isSmartHttpRequest(path)) {
         git_prefixed = false;
-        if (std.mem.indexOfScalar(u8, path, '/')) |slash| {
-            repo_rel = path[1..slash];
+        if (std.mem.indexOfScalar(u8, path[1..], '/')) |slash| {
+            repo_rel = path[1 .. slash + 1];
         } else {
             repo_rel = path[1..];
         }
