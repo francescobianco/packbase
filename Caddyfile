@@ -1,11 +1,14 @@
 {$PACKBASE_DOMAIN} {
-    @git {
+    @git_smart {
         path /git/* /p/*
-        path_regexp git \.git(/|$)
+        path_regexp git_repo \.git(/|$)
+        path_regexp git_short ^/[^/]+/(info/refs|git-upload-pack|git-receive-pack)$
     }
 
-    handle @git {
-        reverse_proxy packbase:8080
+    handle @git_smart {
+        reverse_proxy packbase:8080 {
+            flush_interval -1
+        }
     }
 
     handle {
