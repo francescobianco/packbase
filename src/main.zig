@@ -161,14 +161,39 @@ fn handleFetch(
     // Materialise the tarball at $PACKBASE_ROOT/p/<name>/tag/<tag>.tar.gz
     const pkg_dir = try std.fmt.allocPrint(allocator, "{s}/p/{s}/tag", .{ root, pkg_name });
     defer allocator.free(pkg_dir);
-    try std.fs.cwd().makePath(pkg_dir);
+    // mkdir -p is the most reliable way to create nested absolute dirs.
+    try runCommand(allocator, &[_][]const u8{ "mkdir", "-p", pkg_dir });
 
     const tarball_path = try std.fmt.allocPrint(allocator, "{s}/{s}.tar.gz", .{ pkg_dir, tag });
     defer allocator.free(tarball_path);
 
+    // Check out the resolved tag into the working tree.
     runCommand(allocator, &[_][]const u8{
-        "git", "-C", tmp_path,
-        "archive", "--format=tar.gz", "--output", tarball_path, tag,
+        "git", "-C", tmp_path, "checkout", "--quiet", tag,
+    }) catch {
+        try sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "checkout failed\n");
+        return;
+    };
+
+    // zig fetch expects an archive with a single top-level directory (GitHub
+    // style: repo-tag/).  Creating the tar directly from "." produces a "./"
+    // root entry that confuses Zig's tar parser.  Copy the working tree into a
+    // named staging directory first so the archive contains a proper prefix.
+    const stage_path = try std.fmt.allocPrint(allocator, "{s}_stage", .{tmp_path});
+    defer allocator.free(stage_path);
+    defer std.fs.deleteTreeAbsolute(stage_path) catch {};
+
+    try runCommand(allocator, &[_][]const u8{ "cp", "-r", tmp_path, stage_path });
+    // Drop the .git dir from the staging copy.
+    const stage_git = try std.fs.path.join(allocator, &.{ stage_path, ".git" });
+    defer allocator.free(stage_git);
+    std.fs.deleteTreeAbsolute(stage_git) catch {};
+
+    const stage_parent = std.fs.path.dirname(stage_path) orelse "/tmp";
+    const stage_base = std.fs.path.basename(stage_path);
+
+    runCommand(allocator, &[_][]const u8{
+        "tar", "czf", tarball_path, "-C", stage_parent, stage_base,
     }) catch {
         try sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "archive failed\n");
         return;
@@ -281,7 +306,7 @@ fn contentType(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".md")) return "text/markdown; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".json")) return "application/json";
     if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
-    if (std.mem.endsWith(u8, path, ".tar.gz")) return "application/x-tar";
+    if (std.mem.endsWith(u8, path, ".tar.gz")) return "application/gzip";
     return "application/octet-stream";
 }
 
@@ -305,12 +330,20 @@ fn runCommandOutput(allocator: std.mem.Allocator, argv: []const []const u8) ![]u
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Inherit;
     try child.spawn();
-    const out = try child.stdout.?.reader().readAllAlloc(allocator, 64 * 1024);
-    errdefer allocator.free(out);
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = try child.stdout.?.read(&tmp);
+        if (n == 0) break;
+        try out.appendSlice(allocator, tmp[0..n]);
+    }
+
     const term = try child.wait();
     switch (term) {
         .Exited => |code| if (code != 0) return error.CommandFailed,
         else => return error.CommandFailed,
     }
-    return out;
+    return try out.toOwnedSlice(allocator);
 }
