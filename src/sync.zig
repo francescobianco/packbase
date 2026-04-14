@@ -375,7 +375,9 @@ fn writeTextFile(path: []const u8, content: []const u8) !void {
 }
 
 fn extractSourceRecords(allocator: std.mem.Allocator, raw: []const u8) !std.ArrayList(types.SourceRecord) {
-    const parsed = try std.json.parseFromSlice(types.SourceSnapshot, allocator, raw, .{});
+    const parsed = try std.json.parseFromSlice(types.SourceSnapshot, allocator, raw, .{
+        .ignore_unknown_fields = true,
+    });
     defer parsed.deinit();
 
     var records = std.ArrayList(types.SourceRecord).empty;
