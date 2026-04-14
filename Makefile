@@ -1,6 +1,7 @@
 .PHONY: start deploy test-smoke test-remote clean update logs status
 
 push:
+	@git config credential.helper 'cache --timeout=3600'
 	@git add .
 	@git commit -m "Update" || true
 	@git push
