@@ -27,6 +27,115 @@ The failure occurs even though:
 | curl POST ls-refs on port 8080 (HTTP/1.1) | ✅ valid refs response |
 | `zig fetch --save git+https://...` | ❌ `EndOfStream` |
 
+## Live findings gathered on April 15, 2026
+
+The current live investigation adds stronger evidence that the remaining bug is
+not in `packbase`'s `git-upload-pack` handler itself, but in the public proxy
+path in front of it.
+
+### Confirmed observations
+
+1. `git ls-remote https://pb.yafb.net/lscolors` now works again after removing
+   the incorrect trailing `0002` response-end packet from v2 command responses.
+   This falsified the original H1 as a general fix: appending `0002` breaks Git
+   clients with:
+
+   ```text
+   fatal: remote-curl: unexpected response end packet
+   fatal: expected flush after ref listing
+   ```
+
+2. `zig fetch --save git+https://pb.yafb.net/lscolors` still fails with:
+
+   ```text
+   error: unable to iterate refs: EndOfStream
+   ```
+
+3. The v2 advertisement handshake over HTTPS is correct:
+
+   - `GET /lscolors/info/refs?service=git-upload-pack`
+   - `HTTP/2 200`
+   - body includes `version 2`, `ls-refs=unborn`, `fetch=shallow wait-for-done`
+
+4. The same `ls-refs` POST behaves differently depending on where it is
+   executed:
+
+   - Through the public HTTPS endpoint:
+
+     - `POST https://pb.yafb.net/lscolors/git-upload-pack`
+     - `HTTP/2 200`
+     - `Content-Length: 0`
+     - empty body
+
+   - Directly against the internal `packbase` service from inside the remote
+     Docker network:
+
+     - `POST http://packbase:8080/lscolors/git-upload-pack`
+     - `HTTP/1.1 200`
+     - `Content-Length: 241`
+     - body contains the expected `ls-refs` pkt-line payload
+
+This is the strongest piece of evidence collected so far. The backend produces
+the correct body, but the public path sometimes turns it into an empty `200`
+response before it reaches Zig.
+
+## Why Caddy is now the main suspect
+
+These are the concrete reasons collected during the live investigation:
+
+1. The backend and the public endpoint disagree on the same request.
+   If `packbase:8080` returns `241` bytes and `https://pb.yafb.net/...` returns
+   `0`, the corruption is happening after `packbase` generated the response.
+
+2. The failure appears specifically on the stateless Smart HTTP command POST,
+   not on the advertisement GET.
+   `info/refs` is consistently correct, while `git-upload-pack` `ls-refs` is
+   where the empty-body behaviour appears.
+
+3. The failing public path is served over HTTP/2, while the internal service is
+   plain HTTP/1.1.
+   This keeps pointing to an interaction in the proxy layer between:
+
+   - HTTP/2 stream termination
+   - upstream buffering/flush timing
+   - upstream `Content-Length`
+   - the client's expectation while parsing pkt-line responses
+
+4. Zig is stricter than `git` and `curl`.
+   `git ls-remote` may recover or tolerate cases that Zig's own HTTP/git client
+   treats as EOF during ref iteration. That fits the observed symptom:
+   Git works, Zig still fails.
+
+5. The short pseudo-Git URL path `/lscolors/git-upload-pack` was originally not
+   handled by the dedicated Caddy matcher.
+   That means Smart HTTP requests for the short URL could go through the generic
+   `reverse_proxy` path rather than a Git-specific one, making proxy behaviour
+   inconsistent across URLs.
+
+6. Recreating only `packbase` was insufficient for Caddy-related debugging.
+   Earlier deploys were rebuilding and restarting only the application
+   container, while `caddy` kept running with the old proxy config. This made
+   proxy-layer fixes impossible to validate reliably until `make update` was
+   changed to recreate `caddy` too.
+
+## Current proxy-oriented working theory
+
+The best current theory is:
+
+- `packbase` generates a correct `ls-refs` body
+- Caddy, on the public HTTPS Smart HTTP path, sometimes buffers or terminates
+  the proxied response in a way that turns the upstream body into an empty
+  `200 OK`
+- Zig then waits for pkt-line data that never arrives and reports
+  `EndOfStream`
+
+This is why the current remediation effort focuses on the proxy layer:
+
+- explicit Smart HTTP path matching in `Caddyfile`
+- `flush_interval -1`
+- forcing a cleaner upstream HTTP transport for Smart HTTP requests
+- recreating `caddy` on deploy so config changes actually take effect
+
 The problem is specific to Zig's own HTTP client, which diverges from curl and git-remote-https
 in how it handles the response.
 
