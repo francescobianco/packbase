@@ -111,6 +111,22 @@ Download a previously mirrored tarball.
 
 Dumb-HTTP Git endpoint for pre-baked fixture repositories (used internally by CI).
 
+### `GET /<repo>/…`
+
+Alias del repository Git esposto in radice. Questo consente di clonare un
+repository ospitato da packbase senza il prefisso `/git` e senza il suffisso
+`.git`, ad esempio:
+
+```bash
+git clone https://pb.yafb.net/miopacchetto
+```
+
+Se il consumer usa URL VCS con prefisso `git+https://`, il path resta lo stesso:
+
+```text
+git+https://pb.yafb.net/miopacchetto
+```
+
 ---
 
 ## Running the smoke test
@@ -125,6 +141,12 @@ The smoke test:
 3. Verifies the dumb-HTTP Git endpoint with `git clone`.
 4. Calls `POST /api/fetch` to mirror `serde.zig` from GitHub.
 5. Runs `zig fetch --save` against the packbase URL inside a container and confirms the `build.zig.zon` is updated with the hash.
+
+To verify the short Git URL directly, run:
+
+```bash
+bash test/remote.sh
+```
 
 Artefacts survive in `test/tmp/` for inspection after the run.
 

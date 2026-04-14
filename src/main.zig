@@ -66,7 +66,10 @@ fn handleConnection(
         return;
     }
 
-    const resolved = try resolvePath(allocator, root, path);
+    const routed_path = try routePath(allocator, path);
+    defer allocator.free(routed_path);
+
+    const resolved = try resolvePath(allocator, root, routed_path);
     defer allocator.free(resolved);
 
     var file = std.fs.cwd().openFile(resolved, .{}) catch |err| switch (err) {
@@ -258,6 +261,26 @@ fn requestPath(target: []const u8) []const u8 {
     return target[0..q];
 }
 
+fn routePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (path.len < 2 or path[0] != '/') return allocator.dupe(u8, path);
+
+    const first_end = std.mem.indexOfScalarPos(u8, path, 1, '/') orelse path.len;
+    const repo_name = path[1..first_end];
+    if (repo_name.len == 0) return allocator.dupe(u8, path);
+
+    if (std.mem.eql(u8, repo_name, "api") or
+        std.mem.eql(u8, repo_name, "git") or
+        std.mem.eql(u8, repo_name, "p"))
+    {
+        return allocator.dupe(u8, path);
+    }
+
+    if (std.mem.endsWith(u8, repo_name, ".git")) return allocator.dupe(u8, path);
+
+    const remainder = path[first_end..];
+    return std.fmt.allocPrint(allocator, "/git/{s}.git{s}", .{ repo_name, remainder });
+}
+
 fn resolvePath(allocator: std.mem.Allocator, root: []const u8, raw_path: []const u8) ![]u8 {
     if (raw_path.len == 0 or raw_path[0] != '/') return error.BadRequest;
 
@@ -414,6 +437,11 @@ fn sendLandingPage(connection: *std.net.Server.Connection, head_only: bool) !voi
         \\          <td><span class="method get">GET</span></td>
         \\          <td><code>/git/&lt;repo&gt;.git/&#8230;</code></td>
         \\          <td>Dumb-HTTP Git endpoint for fixture repositories.</td>
+        \\        </tr>
+        \\        <tr>
+        \\          <td><span class="method get">GET</span></td>
+        \\          <td><code>/&lt;repo&gt;/&#8230;</code></td>
+        \\          <td>Alias for cloning hosted repositories without the <code>/git</code> prefix.</td>
         \\        </tr>
         \\      </tbody>
         \\    </table>

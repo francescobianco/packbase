@@ -1,4 +1,4 @@
-.PHONY: start test-smoke
+.PHONY: start test-smoke test-remote
 
 start:
 	@if [ ! -f .env ]; then \
@@ -19,3 +19,7 @@ start:
 test-smoke:
 	@echo "Running smoke tests..."
 	@bash test/smoke.sh
+
+test-remote:
+	@echo "Running remote clone test..."
+	@bash test/remote.sh
