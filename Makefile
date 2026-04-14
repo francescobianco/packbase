@@ -41,8 +41,7 @@ deploy: push
 update:
 	@echo "Pulling latest changes..."
 	@git pull
-	@echo "Generating RELEASE_ID..."
-	@echo "r$$(shell expr $$(date +%s) / 86400)_$$(git rev-parse --short=8 HEAD)" > src/RELEASE_ID
+	@echo "Using RELEASE_ID:"
 	@cat src/RELEASE_ID
 	@echo "Building packbase..."
 	@docker compose build packbase
