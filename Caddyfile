@@ -8,6 +8,10 @@
     handle @git_smart {
         reverse_proxy packbase:8080 {
             flush_interval -1
+            transport http {
+                versions 1.1
+                keepalive off
+            }
         }
     }
 
