@@ -2,12 +2,23 @@ services:
 
   packbase:
     build: .
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        if [ ! -f /data/git/hello.git/HEAD ]; then
+          mkdir -p /data/git
+          sh /seed/create-fixture-repos.sh /data/git /fixtures
+        fi
+        exec /usr/local/bin/packbase
     environment:
       PACKBASE_ROOT: /data
       PACKBASE_PORT: "8080"
       PACKBASE_TOKEN: "${PACKBASE_TOKEN}"
     volumes:
       - packbase-data:/data
+      - ./scripts/create-fixture-repos.sh:/seed/create-fixture-repos.sh:ro
+      - ./test/fixtures:/fixtures:ro
     restart: unless-stopped
     # Not exposed directly — Caddy is the only public entry point.
 

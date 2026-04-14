@@ -51,7 +51,12 @@ docker run -d \
     --network "$NETWORK_NAME" \
     -p "${HOST_PORT}:8080" \
     -e "PACKBASE_TOKEN=${API_TOKEN}" \
-    "$IMAGE_TAG" >/dev/null
+    -v "$ROOT_DIR/scripts/create-fixture-repos.sh:/seed/create-fixture-repos.sh:ro" \
+    -v "$ROOT_DIR/test/fixtures:/fixtures:ro" \
+    --entrypoint /bin/sh \
+    "$IMAGE_TAG" \
+    -lc 'mkdir -p /var/lib/packbase/public/git && sh /seed/create-fixture-repos.sh /var/lib/packbase/public/git /fixtures && exec /usr/local/bin/packbase' \
+    >/dev/null
 
 for _ in $(seq 1 30); do
     if curl -fsS "http://127.0.0.1:${HOST_PORT}/git/hello.git/info/refs" >/dev/null 2>&1; then

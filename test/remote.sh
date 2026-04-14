@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$ROOT_DIR/test/tmp"
-DOMAIN="${1:-${PACKBASE_REMOTE_DOMAIN:-}}"
+DOMAIN="${1:-${PACKBASE_REMOTE_DOMAIN:-pb.yafb.net}}"
 REPO_NAME="${2:-${PACKBASE_REMOTE_REPO:-hello}}"
 SCHEME="${PACKBASE_REMOTE_SCHEME:-https}"
 REMOTE_URL="${SCHEME}://${DOMAIN}/${REPO_NAME}"

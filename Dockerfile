@@ -13,8 +13,7 @@ WORKDIR /src
 COPY . .
 
 RUN /opt/zig/zig build -Doptimize=ReleaseSafe
-RUN mkdir -p /out/public/git
-RUN sh ./scripts/create-fixture-repos.sh /out/public/git ./test/fixtures
+RUN mkdir -p /out
 RUN cp zig-out/bin/packbase /out/packbase
 
 FROM alpine:3.20
@@ -22,7 +21,7 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates git
 
 COPY --from=build /out/packbase /usr/local/bin/packbase
-COPY --from=build /out/public /var/lib/packbase/public
+RUN mkdir -p /var/lib/packbase/public
 
 ENV PACKBASE_ROOT=/var/lib/packbase/public
 ENV PACKBASE_PORT=8080

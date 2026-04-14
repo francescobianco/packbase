@@ -29,6 +29,10 @@ docker run -p 8080:8080 \
   packbase
 ```
 
+L'immagine di produzione non include fixture pre-caricati. Se vuoi avere sempre
+almeno un pacchetto disponibile su un deployment Compose, `compose.yml` monta i
+fixture di test e li materializza sul volume dati al bootstrap del container.
+
 ### Mirror a package
 
 ```bash
