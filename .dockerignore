@@ -2,3 +2,4 @@
 .idea
 .zig-cache
 zig-out
+data
