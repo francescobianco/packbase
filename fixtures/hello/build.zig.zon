@@ -1,1 +1,5 @@
-.{ .name = "hello-fixture", .version = "0.1.0" }
+.{
+    .name = .hello_fixture,
+    .version = "0.1.0",
+    .paths = .{""},
+}

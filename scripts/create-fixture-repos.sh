@@ -31,5 +31,11 @@ for fixture_dir in "$fixtures_dir"/*; do
     git -C "$repo_dir" symbolic-ref HEAD refs/heads/main
     git -C "$repo_dir" update-server-info
 
+    # Create a tarball consumable by `zig fetch --save http://…`.
+    # Path mirrors the future /p/<name>/tag/<tag>.tar.gz layout from DESIGN.md.
+    pkg_dir="$(dirname "$output_dir")/p/${fixture_name}/tag"
+    mkdir -p "$pkg_dir"
+    git -C "$repo_dir" archive --format=tar.gz v0.1.0 > "${pkg_dir}/v0.1.0.tar.gz"
+
     rm -rf "$work_dir"
 done

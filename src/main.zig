@@ -5,15 +5,18 @@ const Request = struct {
     target: []const u8,
 };
 
+const FetchPayload = struct {
+    url: []const u8,
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const root_env = std.posix.getenv("PACKBASE_ROOT");
-    const port_env = std.posix.getenv("PACKBASE_PORT");
-    const root = if (root_env) |value| value else "public";
-    const port_text = if (port_env) |value| value else "8080";
+    const root = std.posix.getenv("PACKBASE_ROOT") orelse "public";
+    const port_text = std.posix.getenv("PACKBASE_PORT") orelse "8080";
+    const token = std.posix.getenv("PACKBASE_TOKEN"); // null = auth disabled
     const port = try std.fmt.parseInt(u16, port_text, 10);
 
     const address = try std.net.Address.parseIp("0.0.0.0", port);
@@ -26,30 +29,42 @@ pub fn main() !void {
         var connection = try server.accept();
         defer connection.stream.close();
 
-        handleConnection(allocator, &connection, root) catch |err| {
+        handleConnection(allocator, &connection, root, token) catch |err| {
             std.log.warn("request failed: {s}", .{@errorName(err)});
         };
     }
 }
 
-fn handleConnection(allocator: std.mem.Allocator, connection: *std.net.Server.Connection, root: []const u8) !void {
-    var buffer: [8192]u8 = undefined;
-    const bytes_read = try connection.stream.read(&buffer);
+fn handleConnection(
+    allocator: std.mem.Allocator,
+    connection: *std.net.Server.Connection,
+    root: []const u8,
+    token: ?[]const u8,
+) !void {
+    const buffer = try allocator.alloc(u8, 65536);
+    defer allocator.free(buffer);
+    const bytes_read = try connection.stream.read(buffer);
     if (bytes_read == 0) return;
 
-    const request = try parseRequest(buffer[0..bytes_read]);
-    const head_only = std.mem.eql(u8, request.method, "HEAD");
+    const raw = buffer[0..bytes_read];
+    const request = try parseRequest(raw);
+    const path = requestPath(request.target);
 
+    if (std.mem.eql(u8, request.method, "POST") and std.mem.eql(u8, path, "/api/fetch")) {
+        try handleFetch(allocator, connection, root, token, raw);
+        return;
+    }
+
+    const head_only = std.mem.eql(u8, request.method, "HEAD");
     if (!std.mem.eql(u8, request.method, "GET") and !head_only) {
         try sendSimpleResponse(connection, "405 Method Not Allowed", "text/plain", "method not allowed\n");
         return;
     }
 
-    const path = requestPath(request.target);
-    const resolved_path = try resolvePath(allocator, root, path);
-    defer allocator.free(resolved_path);
+    const resolved = try resolvePath(allocator, root, path);
+    defer allocator.free(resolved);
 
-    var file = std.fs.cwd().openFile(resolved_path, .{}) catch |err| switch (err) {
+    var file = std.fs.cwd().openFile(resolved, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             try sendSimpleResponse(connection, "404 Not Found", "text/plain", "not found\n");
             return;
@@ -63,37 +78,154 @@ fn handleConnection(allocator: std.mem.Allocator, connection: *std.net.Server.Co
     defer file.close();
 
     const stat = try file.stat();
-    const size = stat.size;
-
-    try writeHeaders(connection, "200 OK", contentType(resolved_path), size);
+    try writeHeaders(connection, "200 OK", contentType(resolved), stat.size);
     if (head_only) return;
 
-    var file_buffer: [4096]u8 = undefined;
+    var file_buf: [4096]u8 = undefined;
     while (true) {
-        const chunk_len = try file.read(&file_buffer);
-        if (chunk_len == 0) break;
-        try connection.stream.writeAll(file_buffer[0..chunk_len]);
+        const n = try file.read(&file_buf);
+        if (n == 0) break;
+        try connection.stream.writeAll(file_buf[0..n]);
     }
+}
+
+fn handleFetch(
+    allocator: std.mem.Allocator,
+    connection: *std.net.Server.Connection,
+    root: []const u8,
+    token: ?[]const u8,
+    raw: []const u8,
+) !void {
+    // Validate Bearer token when PACKBASE_TOKEN is set.
+    if (token) |expected| {
+        const auth = findHeader(raw, "Authorization") orelse {
+            try sendSimpleResponse(connection, "401 Unauthorized", "text/plain", "unauthorized\n");
+            return;
+        };
+        const prefix = "Bearer ";
+        if (!std.mem.startsWith(u8, auth, prefix) or
+            !std.mem.eql(u8, auth[prefix.len..], expected))
+        {
+            try sendSimpleResponse(connection, "403 Forbidden", "text/plain", "forbidden\n");
+            return;
+        }
+    }
+
+    // Parse JSON body: {"url": "git+https://..."}
+    const body = findBody(raw);
+    if (body.len == 0) {
+        try sendSimpleResponse(connection, "400 Bad Request", "text/plain", "empty body\n");
+        return;
+    }
+    const parsed = std.json.parseFromSlice(FetchPayload, allocator, body, .{}) catch {
+        try sendSimpleResponse(connection, "400 Bad Request", "text/plain", "invalid json\n");
+        return;
+    };
+    defer parsed.deinit();
+    const url = parsed.value.url;
+
+    // Derive package name: "git+https://github.com/User/serde.zig" -> "serde.zig"
+    const http_url = if (std.mem.startsWith(u8, url, "git+")) url[4..] else url;
+    const slash_pos = std.mem.lastIndexOfScalar(u8, http_url, '/') orelse 0;
+    const raw_name = http_url[slash_pos + 1 ..];
+    const pkg_name = if (std.mem.endsWith(u8, raw_name, ".git"))
+        raw_name[0 .. raw_name.len - 4]
+    else
+        raw_name;
+
+    // Unique temp directory for the clone.
+    const tmp_path = try std.fmt.allocPrint(
+        allocator,
+        "/tmp/packbase-{d}",
+        .{std.time.nanoTimestamp()},
+    );
+    defer allocator.free(tmp_path);
+    defer std.fs.deleteTreeAbsolute(tmp_path) catch {};
+
+    // Clone the upstream repository.
+    runCommand(allocator, &[_][]const u8{ "git", "clone", "--quiet", http_url, tmp_path }) catch {
+        try sendSimpleResponse(connection, "502 Bad Gateway", "text/plain", "git clone failed\n");
+        return;
+    };
+
+    // Resolve the most recent tag.
+    const tag_raw = runCommandOutput(allocator, &[_][]const u8{
+        "git", "-C", tmp_path, "describe", "--tags", "--abbrev=0",
+    }) catch {
+        try sendSimpleResponse(connection, "422 Unprocessable Entity", "text/plain", "no tags found\n");
+        return;
+    };
+    defer allocator.free(tag_raw);
+    const tag = std.mem.trim(u8, tag_raw, " \t\r\n");
+
+    // Materialise the tarball at $PACKBASE_ROOT/p/<name>/tag/<tag>.tar.gz
+    const pkg_dir = try std.fmt.allocPrint(allocator, "{s}/p/{s}/tag", .{ root, pkg_name });
+    defer allocator.free(pkg_dir);
+    try std.fs.cwd().makePath(pkg_dir);
+
+    const tarball_path = try std.fmt.allocPrint(allocator, "{s}/{s}.tar.gz", .{ pkg_dir, tag });
+    defer allocator.free(tarball_path);
+
+    runCommand(allocator, &[_][]const u8{
+        "git", "-C", tmp_path,
+        "archive", "--format=tar.gz", "--output", tarball_path, tag,
+    }) catch {
+        try sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "archive failed\n");
+        return;
+    };
+
+    // Respond with the local URL where the package is now reachable.
+    const pkg_url = try std.fmt.allocPrint(
+        allocator,
+        "/p/{s}/tag/{s}.tar.gz",
+        .{ pkg_name, tag },
+    );
+    defer allocator.free(pkg_url);
+
+    const resp_body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"status\":\"ok\",\"package\":\"{s}\",\"tag\":\"{s}\",\"url\":\"{s}\"}}\n",
+        .{ pkg_name, tag, pkg_url },
+    );
+    defer allocator.free(resp_body);
+
+    try writeHeaders(connection, "200 OK", "application/json", resp_body.len);
+    try connection.stream.writeAll(resp_body);
+}
+
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+fn findHeader(raw: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, raw, "\r\n");
+    _ = lines.next(); // skip request line
+    while (lines.next()) |line| {
+        if (line.len == 0) break; // empty line ends headers
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const hname = std.mem.trim(u8, line[0..colon], " ");
+        const hvalue = std.mem.trim(u8, line[colon + 1 ..], " ");
+        if (std.ascii.eqlIgnoreCase(hname, name)) return hvalue;
+    }
+    return null;
+}
+
+fn findBody(raw: []const u8) []const u8 {
+    const sep = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return "";
+    return raw[sep + 4 ..];
 }
 
 fn parseRequest(raw: []const u8) !Request {
     const line_end = std.mem.indexOf(u8, raw, "\r\n") orelse return error.BadRequest;
     const line = raw[0..line_end];
-
     var parts = std.mem.splitScalar(u8, line, ' ');
     const method = parts.next() orelse return error.BadRequest;
     const target = parts.next() orelse return error.BadRequest;
     _ = parts.next() orelse return error.BadRequest;
-
-    return .{
-        .method = method,
-        .target = target,
-    };
+    return .{ .method = method, .target = target };
 }
 
 fn requestPath(target: []const u8) []const u8 {
-    const query_start = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
-    return target[0..query_start];
+    const q = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
+    return target[0..q];
 }
 
 fn resolvePath(allocator: std.mem.Allocator, root: []const u8, raw_path: []const u8) ![]u8 {
@@ -114,24 +246,34 @@ fn resolvePath(allocator: std.mem.Allocator, root: []const u8, raw_path: []const
     return std.fs.path.join(allocator, parts.items);
 }
 
-fn writeHeaders(connection: *std.net.Server.Connection, status: []const u8, mime: []const u8, size: u64) !void {
-    var header_buffer: [512]u8 = undefined;
-    const response = try std.fmt.bufPrint(
-        &header_buffer,
+fn writeHeaders(
+    connection: *std.net.Server.Connection,
+    status: []const u8,
+    mime: []const u8,
+    size: u64,
+) !void {
+    var buf: [512]u8 = undefined;
+    const resp = try std.fmt.bufPrint(
+        &buf,
         "HTTP/1.1 {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\nConnection: close\r\n\r\n",
         .{ status, size, mime },
     );
-    try connection.stream.writeAll(response);
+    try connection.stream.writeAll(resp);
 }
 
-fn sendSimpleResponse(connection: *std.net.Server.Connection, status: []const u8, mime: []const u8, body: []const u8) !void {
-    var header_buffer: [512]u8 = undefined;
-    const response = try std.fmt.bufPrint(
-        &header_buffer,
+fn sendSimpleResponse(
+    connection: *std.net.Server.Connection,
+    status: []const u8,
+    mime: []const u8,
+    body: []const u8,
+) !void {
+    var buf: [512]u8 = undefined;
+    const resp = try std.fmt.bufPrint(
+        &buf,
         "HTTP/1.1 {s}\r\nContent-Length: {d}\r\nContent-Type: {s}\r\nConnection: close\r\n\r\n{s}",
         .{ status, body.len, mime, body },
     );
-    try connection.stream.writeAll(response);
+    try connection.stream.writeAll(resp);
 }
 
 fn contentType(path: []const u8) []const u8 {
@@ -139,5 +281,36 @@ fn contentType(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".md")) return "text/markdown; charset=utf-8";
     if (std.mem.endsWith(u8, path, ".json")) return "application/json";
     if (std.mem.endsWith(u8, path, ".html")) return "text/html; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".tar.gz")) return "application/x-tar";
     return "application/octet-stream";
+}
+
+// ── Child process helpers ─────────────────────────────────────────────────────
+
+fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Close;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Inherit;
+    const term = try child.spawnAndWait();
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
+}
+
+fn runCommandOutput(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Close;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+    const out = try child.stdout.?.reader().readAllAlloc(allocator, 64 * 1024);
+    errdefer allocator.free(out);
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
+    return out;
 }
