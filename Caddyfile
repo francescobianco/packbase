@@ -1,3 +1,14 @@
 {$PACKBASE_DOMAIN} {
-    reverse_proxy packbase:8080
+    @git {
+        path /git/* /p/*
+        path_regexp git \.git(/|$)
+    }
+
+    handle @git {
+        reverse_proxy packbase:8080
+    }
+
+    handle {
+        reverse_proxy packbase:8080
+    }
 }
