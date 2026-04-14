@@ -1,4 +1,4 @@
-.PHONY: start test-smoke test-remote clean update logs status
+.PHONY: start deploy test-smoke test-remote clean update logs status
 
 push:
 	@git add .
@@ -20,6 +20,22 @@ start:
 		echo ".env created."; \
 	fi
 	docker compose up -d
+
+deploy: push
+	@if [ ! -f .hosts ]; then \
+		echo "No .hosts file found."; \
+		echo "Create .hosts with one entry per line:  host=<h> user=<u> password=<p> pwd=<dir>"; \
+		exit 1; \
+	fi
+	@while IFS= read -r line || [ -n "$$line" ]; do \
+		case "$$line" in ''|\#*) continue ;; esac; \
+		H=$$(echo "$$line" | sed 's/.*host=\([^ ]*\).*/\1/'); \
+		U=$$(echo "$$line" | sed 's/.*user=\([^ ]*\).*/\1/'); \
+		P=$$(echo "$$line" | sed 's/.*password=\([^ ]*\).*/\1/'); \
+		D=$$(echo "$$line" | sed 's/.*pwd=\([^ ]*\).*/\1/'); \
+		echo "→ $$U@$$H:$$D"; \
+		sshpass -p "$$P" ssh -o StrictHostKeyChecking=no "$$U@$$H" "cd '$$D' && make update"; \
+	done < .hosts
 
 update:
 	@echo "Pulling latest changes..."

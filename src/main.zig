@@ -61,6 +61,11 @@ fn handleConnection(
         }
     }
 
+    if (http.isSmartHttpRequest(path)) {
+        try handleSmartHttp(allocator, connection, root, request, raw, head_only);
+        return;
+    }
+
     if (!std.mem.eql(u8, request.method, "GET") and !head_only) {
         try http.sendSimpleResponse(connection, "405 Method Not Allowed", "text/plain", "method not allowed\n");
         return;
@@ -77,13 +82,6 @@ fn handleConnection(
     if (std.mem.eql(u8, path, "/")) {
         try http.sendLandingPage(connection, head_only);
         return;
-    }
-
-    if (std.mem.eql(u8, request.method, "GET") or std.mem.eql(u8, request.method, "POST")) {
-        if (http.isSmartHttpRequest(path)) {
-            try handleSmartHttp(allocator, connection, root, request, raw, head_only);
-            return;
-        }
     }
 
     const routed_path = try http.routePath(allocator, path);
@@ -607,7 +605,7 @@ fn handleUploadPackAdvertise(
     };
     defer allocator.free(output);
 
-    const body_len = output.len + 4;
+    const body_len = output.len + 34; // 30 bytes "001e# service=git-upload-pack\n" + 4 bytes "0000"
     var headers: [128]u8 = undefined;
     const resp = try std.fmt.bufPrint(
         &headers,

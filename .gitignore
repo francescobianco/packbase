@@ -5,3 +5,4 @@ test/tmp/
 data/
 !data/.gitkeep
 .env
+.hosts
