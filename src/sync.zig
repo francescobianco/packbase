@@ -351,6 +351,10 @@ fn ensureRepoTarball(
     const tarball_path = try std.fs.path.join(allocator, &.{ pkg_dir, tarball_name });
     defer allocator.free(tarball_path);
 
+    if (std.fs.path.dirname(tarball_path)) |tarball_parent| {
+        try shell.runCommand(allocator, &[_][]const u8{ "mkdir", "-p", tarball_parent });
+    }
+
     if (std.fs.cwd().access(tarball_path, .{})) |_| {
         stats.tarballs_present += 1;
         std.log.info("tarball present package={s} tag={s}", .{ package_name, tag });
