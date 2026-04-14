@@ -107,6 +107,17 @@ Mirror an upstream Git repository.
 
 Download a previously mirrored tarball.
 
+### `GET /api/list`
+
+Restituisce i pacchetti attualmente disponibili nell'istanza packbase.
+
+**Response `200`**
+```json
+{
+  "packages": ["hello", "serde.zig"]
+}
+```
+
 ### `GET /git/<repo>.git/…`
 
 Dumb-HTTP Git endpoint for pre-baked fixture repositories (used internally by CI).

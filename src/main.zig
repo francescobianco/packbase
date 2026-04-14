@@ -61,6 +61,11 @@ fn handleConnection(
         return;
     }
 
+    if (std.mem.eql(u8, path, "/api/list")) {
+        try handleList(allocator, connection, root, head_only);
+        return;
+    }
+
     if (std.mem.eql(u8, path, "/")) {
         try sendLandingPage(connection, head_only);
         return;
@@ -226,7 +231,78 @@ fn handleFetch(
     try connection.stream.writeAll(resp_body);
 }
 
+fn handleList(
+    allocator: std.mem.Allocator,
+    connection: *std.net.Server.Connection,
+    root: []const u8,
+    head_only: bool,
+) !void {
+    const packages = try listPackagesJson(allocator, root);
+    defer allocator.free(packages);
+
+    try writeHeaders(connection, "200 OK", "application/json", packages.len);
+    if (!head_only) try connection.stream.writeAll(packages);
+}
+
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+fn listPackagesJson(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    const packages_root = try std.fs.path.join(allocator, &.{ root, "p" });
+    defer allocator.free(packages_root);
+
+    var dir = std.fs.cwd().openDir(packages_root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return allocator.dupe(u8, "{\"packages\":[]}\n"),
+        else => return err,
+    };
+    defer dir.close();
+
+    var entries = std.ArrayList([]u8).empty;
+    defer {
+        for (entries.items) |entry| allocator.free(entry);
+        entries.deinit(allocator);
+    }
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        try entries.append(allocator, try allocator.dupe(u8, entry.name));
+    }
+
+    std.mem.sort([]u8, entries.items, {}, sortStringAsc);
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+
+    try body.appendSlice(allocator, "{\"packages\":[");
+    for (entries.items, 0..) |name, index| {
+        if (index != 0) try body.append(allocator, ',');
+        try appendJsonString(allocator, &body, name);
+    }
+    try body.appendSlice(allocator, "]}\n");
+
+    return body.toOwnedSlice(allocator);
+}
+
+fn sortStringAsc(_: void, a: []u8, b: []u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+fn appendJsonString(
+    allocator: std.mem.Allocator,
+    body: *std.ArrayList(u8),
+    value: []const u8,
+) !void {
+    try body.append(allocator, '"');
+    for (value) |ch| switch (ch) {
+        '"' => try body.appendSlice(allocator, "\\\""),
+        '\\' => try body.appendSlice(allocator, "\\\\"),
+        '\n' => try body.appendSlice(allocator, "\\n"),
+        '\r' => try body.appendSlice(allocator, "\\r"),
+        '\t' => try body.appendSlice(allocator, "\\t"),
+        else => try body.append(allocator, ch),
+    };
+    try body.append(allocator, '"');
+}
 
 fn findHeader(raw: []const u8, name: []const u8) ?[]const u8 {
     var lines = std.mem.splitSequence(u8, raw, "\r\n");
@@ -432,6 +508,11 @@ fn sendLandingPage(connection: *std.net.Server.Connection, head_only: bool) !voi
         \\          <td><span class="method get">GET</span></td>
         \\          <td><code>/p/&lt;pkg&gt;/tag/&lt;tag&gt;.tar.gz</code></td>
         \\          <td>Download a mirrored tarball for <code>zig fetch --save</code>.</td>
+        \\        </tr>
+        \\        <tr>
+        \\          <td><span class="method get">GET</span></td>
+        \\          <td><code>/api/list</code></td>
+        \\          <td>Return the list of mirrored packages currently available on this instance.</td>
         \\        </tr>
         \\        <tr>
         \\          <td><span class="method get">GET</span></td>

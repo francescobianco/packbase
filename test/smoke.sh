@@ -88,6 +88,16 @@ test -n "$PKG_URL"
 
 printf 'api/fetch: OK (%s)\n' "$PKG_URL"
 
+# ── Phase 5b: list packages available on this instance ───────────────────────
+LIST_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/list")"
+
+printf 'api/list response: %s\n' "$LIST_RESP"
+
+printf '%s' "$LIST_RESP" | grep -q '"hello"'
+printf '%s' "$LIST_RESP" | grep -q '"serde.zig"'
+
+printf 'api/list: OK\n'
+
 # ── Phase 6: install the mirrored package with zig fetch --save ───────────────
 # The Zig runner resolves the package from packbase (not from GitHub), which is
 # the core promise of the service.
