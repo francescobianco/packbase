@@ -145,7 +145,13 @@ The smoke test:
 To verify the short Git URL directly, run:
 
 ```bash
-bash test/remote.sh
+bash test/remote.sh pb.yafb.net hello
+```
+
+Or:
+
+```bash
+PACKBASE_REMOTE_DOMAIN=pb.yafb.net bash test/remote.sh
 ```
 
 Artefacts survive in `test/tmp/` for inspection after the run.

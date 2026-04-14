@@ -22,4 +22,4 @@ test-smoke:
 
 test-remote:
 	@echo "Running remote clone test..."
-	@bash test/remote.sh
+	@bash test/remote.sh "$(PACKBASE_REMOTE_DOMAIN)" "$(or $(PACKBASE_REMOTE_REPO),hello)"

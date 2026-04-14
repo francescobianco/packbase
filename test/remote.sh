@@ -2,38 +2,33 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE_TAG="packbase-remote:local"
-CONTAINER_NAME="packbase-remote-$$"
-HOST_PORT="${PACKBASE_TEST_PORT:-18081}"
 TMP_DIR="$ROOT_DIR/test/tmp"
+DOMAIN="${1:-${PACKBASE_REMOTE_DOMAIN:-}}"
+REPO_NAME="${2:-${PACKBASE_REMOTE_REPO:-hello}}"
+SCHEME="${PACKBASE_REMOTE_SCHEME:-https}"
+REMOTE_URL="${SCHEME}://${DOMAIN}/${REPO_NAME}"
+TARGET_DIR="$TMP_DIR/remote-clone"
 
-rm -rf "$TMP_DIR/remote-clone"
+if [ -z "$DOMAIN" ]; then
+    printf 'usage: %s <domain> [repo]\n' "${BASH_SOURCE[0]}" >&2
+    printf 'or set PACKBASE_REMOTE_DOMAIN and optionally PACKBASE_REMOTE_REPO\n' >&2
+    exit 64
+fi
+
+rm -rf "$TARGET_DIR"
 mkdir -p "$TMP_DIR"
 
-cleanup() {
-    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-}
+if ! curl -fsS "${REMOTE_URL}/info/refs" >/dev/null; then
+    printf 'remote repository endpoint not available: %s/info/refs\n' "$REMOTE_URL" >&2
+    printf 'expected a deployed packbase instance exposing root-level clone paths\n' >&2
+    exit 1
+fi
 
-trap cleanup EXIT
+git clone "$REMOTE_URL" "$TARGET_DIR" >/dev/null 2>&1
 
-docker build -t "$IMAGE_TAG" "$ROOT_DIR" >/dev/null
-
-docker run -d \
-    --name "$CONTAINER_NAME" \
-    -p "${HOST_PORT}:8080" \
-    "$IMAGE_TAG" >/dev/null
-
-for _ in $(seq 1 30); do
-    if curl -fsS "http://127.0.0.1:${HOST_PORT}/hello/info/refs" >/dev/null 2>&1; then
-        break
-    fi
-    sleep 1
-done
-
-git clone "http://127.0.0.1:${HOST_PORT}/hello" "$TMP_DIR/remote-clone" >/dev/null 2>&1
-
-test -f "$TMP_DIR/remote-clone/build.zig.zon"
-grep -q 'hello_fixture' "$TMP_DIR/remote-clone/build.zig.zon"
+test -f "$TARGET_DIR/build.zig.zon"
+grep -q 'hello_fixture' "$TARGET_DIR/build.zig.zon"
 
 printf 'remote git clone without /git prefix: OK\n'
-printf 'example VCS URL shape: git+https://pb.yafb.net/hello\n'
+printf 'tested clone url: %s\n' "$REMOTE_URL"
+printf 'example VCS URL shape: git+https://%s/%s\n' "$DOMAIN" "$REPO_NAME"
