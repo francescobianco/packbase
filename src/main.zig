@@ -1,4 +1,5 @@
 const std = @import("std");
+const release_id_raw = @embedFile("RELEASE_ID");
 
 const Request = struct {
     method: []const u8,
@@ -63,6 +64,11 @@ fn handleConnection(
 
     if (std.mem.eql(u8, path, "/api/list")) {
         try handleList(allocator, connection, root, head_only);
+        return;
+    }
+
+    if (std.mem.eql(u8, path, "/api/info")) {
+        try handleInfo(allocator, connection, head_only);
         return;
     }
 
@@ -242,6 +248,23 @@ fn handleList(
 
     try writeHeaders(connection, "200 OK", "application/json", packages.len);
     if (!head_only) try connection.stream.writeAll(packages);
+}
+
+fn handleInfo(
+    allocator: std.mem.Allocator,
+    connection: *std.net.Server.Connection,
+    head_only: bool,
+) !void {
+    const release_id = std.mem.trimRight(u8, release_id_raw, "\r\n");
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"service\":\"packbase\",\"release\":\"{s}\"}}\n",
+        .{release_id},
+    );
+    defer allocator.free(body);
+
+    try writeHeaders(connection, "200 OK", "application/json", body.len);
+    if (!head_only) try connection.stream.writeAll(body);
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -513,6 +536,11 @@ fn sendLandingPage(connection: *std.net.Server.Connection, head_only: bool) !voi
         \\          <td><span class="method get">GET</span></td>
         \\          <td><code>/api/list</code></td>
         \\          <td>Return the list of mirrored packages currently available on this instance.</td>
+        \\        </tr>
+        \\        <tr>
+        \\          <td><span class="method get">GET</span></td>
+        \\          <td><code>/api/info</code></td>
+        \\          <td>Return service metadata including the release identifier served by this instance.</td>
         \\        </tr>
         \\        <tr>
         \\          <td><span class="method get">GET</span></td>

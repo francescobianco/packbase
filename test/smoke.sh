@@ -9,6 +9,7 @@ NETWORK_NAME="packbase-smoke-net-$$"
 HOST_PORT="${PACKBASE_TEST_PORT:-18080}"
 API_TOKEN="${PACKBASE_TEST_TOKEN:-smoke-test-token}"
 TMP_DIR="$ROOT_DIR/test/tmp"
+EXPECTED_RELEASE="$(tr -d '\r\n' < "$ROOT_DIR/src/RELEASE_ID")"
 
 # Wipe and recreate so each run starts clean but the directory survives after
 # the test for inspection.
@@ -102,6 +103,16 @@ printf '%s' "$LIST_RESP" | grep -q '"hello"'
 printf '%s' "$LIST_RESP" | grep -q '"serde.zig"'
 
 printf 'api/list: OK\n'
+
+# ── Phase 5c: verify the release identifier exposed by this build ────────────
+RELEASE_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/info")"
+
+printf 'api/info response: %s\n' "$RELEASE_RESP"
+
+printf '%s' "$RELEASE_RESP" | grep -q "\"release\":\"${EXPECTED_RELEASE}\""
+printf '%s' "$RELEASE_RESP" | grep -q '"service":"packbase"'
+
+printf 'api/info: OK\n'
 
 # ── Phase 6: install the mirrored package with zig fetch --save ───────────────
 # The Zig runner resolves the package from packbase (not from GitHub), which is

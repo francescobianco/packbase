@@ -122,6 +122,19 @@ Restituisce i pacchetti attualmente disponibili nell'istanza packbase.
 }
 ```
 
+### `GET /api/info`
+
+Restituisce metadati dell'istanza, incluso l'identificativo di rilascio della
+build servita.
+
+**Response `200`**
+```json
+{
+  "service": "packbase",
+  "release": "r0001"
+}
+```
+
 ### `GET /git/<repo>.git/…`
 
 Dumb-HTTP Git endpoint for pre-baked fixture repositories (used internally by CI).
@@ -160,13 +173,13 @@ The smoke test:
 To verify the short Git URL directly, run:
 
 ```bash
-bash test/remote.sh pb.yafb.net hello
+bash test/remote.sh pb.yafb.net hello r0001
 ```
 
 Or:
 
 ```bash
-PACKBASE_REMOTE_DOMAIN=pb.yafb.net bash test/remote.sh
+PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0001 bash test/remote.sh
 ```
 
 Artefacts survive in `test/tmp/` for inspection after the run.

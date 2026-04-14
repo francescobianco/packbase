@@ -5,18 +5,41 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$ROOT_DIR/test/tmp"
 DOMAIN="${1:-${PACKBASE_REMOTE_DOMAIN:-pb.yafb.net}}"
 REPO_NAME="${2:-${PACKBASE_REMOTE_REPO:-hello}}"
+EXPECTED_RELEASE="${3:-${PACKBASE_EXPECTED_RELEASE:-}}"
 SCHEME="${PACKBASE_REMOTE_SCHEME:-https}"
 REMOTE_URL="${SCHEME}://${DOMAIN}/${REPO_NAME}"
 TARGET_DIR="$TMP_DIR/remote-clone"
+INFO_URL="${SCHEME}://${DOMAIN}/api/info"
 
 if [ -z "$DOMAIN" ]; then
-    printf 'usage: %s <domain> [repo]\n' "${BASH_SOURCE[0]}" >&2
-    printf 'or set PACKBASE_REMOTE_DOMAIN and optionally PACKBASE_REMOTE_REPO\n' >&2
+    printf 'usage: %s <domain> [repo] [expected-release]\n' "${BASH_SOURCE[0]}" >&2
+    printf 'or set PACKBASE_REMOTE_DOMAIN, PACKBASE_REMOTE_REPO, PACKBASE_EXPECTED_RELEASE\n' >&2
     exit 64
 fi
 
 rm -rf "$TARGET_DIR"
 mkdir -p "$TMP_DIR"
+
+if ! RELEASE_RESP="$(curl -fsS "$INFO_URL")"; then
+    printf 'remote info endpoint not available: %s\n' "$INFO_URL" >&2
+    printf 'expected a deployed packbase instance exposing /api/info\n' >&2
+    exit 1
+fi
+
+REMOTE_RELEASE="$(printf '%s' "$RELEASE_RESP" | sed 's/.*"release":"\([^"]*\)".*/\1/')"
+
+if [ -z "$REMOTE_RELEASE" ]; then
+    printf 'could not parse release identifier from %s\n' "$INFO_URL" >&2
+    printf 'raw response: %s\n' "$RELEASE_RESP" >&2
+    exit 1
+fi
+
+printf 'remote release: %s\n' "$REMOTE_RELEASE"
+
+if [ -n "$EXPECTED_RELEASE" ] && [ "$REMOTE_RELEASE" != "$EXPECTED_RELEASE" ]; then
+    printf 'release mismatch: expected %s but remote serves %s\n' "$EXPECTED_RELEASE" "$REMOTE_RELEASE" >&2
+    exit 1
+fi
 
 if ! curl -fsS "${REMOTE_URL}/info/refs" >/dev/null; then
     printf 'remote repository endpoint not available: %s/info/refs\n' "$REMOTE_URL" >&2
