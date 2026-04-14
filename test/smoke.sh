@@ -53,10 +53,11 @@ docker run -d \
     -p "${HOST_PORT}:8080" \
     -e "PACKBASE_TOKEN=${API_TOKEN}" \
     -v "$ROOT_DIR/scripts/create-fixture-repos.sh:/seed/create-fixture-repos.sh:ro" \
+    -v "$ROOT_DIR/scripts/seed-packbase-data.sh:/seed/seed-packbase-data.sh:ro" \
     -v "$ROOT_DIR/test/fixtures:/fixtures:ro" \
     --entrypoint /bin/sh \
     "$IMAGE_TAG" \
-    -lc 'mkdir -p /var/lib/packbase/public/git && sh /seed/create-fixture-repos.sh /var/lib/packbase/public/git /fixtures && exec /usr/local/bin/packbase' \
+    -lc 'sh /seed/seed-packbase-data.sh /var/lib/packbase/public /fixtures && exec /usr/local/bin/packbase' \
     >/dev/null
 
 for _ in $(seq 1 30); do

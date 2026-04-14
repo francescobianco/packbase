@@ -32,6 +32,8 @@ docker run -p 8080:8080 \
 L'immagine di produzione non include fixture pre-caricati. Se vuoi avere sempre
 almeno un pacchetto disponibile su un deployment Compose, `compose.yml` monta i
 fixture di test e li materializza sul volume dati al bootstrap del container.
+Se i fixture montati non sono presenti, il bootstrap genera comunque un
+pacchetto seed `hello` incorporato.
 
 ### Mirror a package
 
@@ -131,7 +133,7 @@ build servita.
 ```json
 {
   "service": "packbase",
-  "release": "r0002"
+  "release": "r0003"
 }
 ```
 
@@ -173,13 +175,13 @@ The smoke test:
 To verify the short Git URL directly, run:
 
 ```bash
-bash test/remote.sh pb.yafb.net hello r0002
+bash test/remote.sh pb.yafb.net hello r0003
 ```
 
 Or:
 
 ```bash
-PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0002 bash test/remote.sh
+PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0003 bash test/remote.sh
 ```
 
 Artefacts survive in `test/tmp/` for inspection after the run.
