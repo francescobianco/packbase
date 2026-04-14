@@ -661,7 +661,11 @@ fn handleUploadPackRequest(
     };
     defer allocator.free(out);
 
-    const body_len = out.len;
+    // In git protocol v2, each command response must be terminated with a "0002"
+    // response-end packet. Without it zig fetch (and other v2 clients) stall
+    // waiting for more data and surface the connection close as EndOfStream.
+    const suffix: []const u8 = if (use_v2) "0002" else "";
+    const body_len = out.len + suffix.len;
     var headers: [128]u8 = undefined;
     const resp = try std.fmt.bufPrint(
         &headers,
@@ -672,5 +676,6 @@ fn handleUploadPackRequest(
     try connection.stream.writeAll(resp);
     if (!head_only) {
         try connection.stream.writeAll(out);
+        if (suffix.len > 0) try connection.stream.writeAll(suffix);
     }
 }
