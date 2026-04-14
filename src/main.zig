@@ -640,7 +640,7 @@ fn handleUploadPackRequest(
     const tmp_input = try std.fs.path.join(allocator, &.{ "/tmp", try std.fmt.allocPrint(allocator, "gitreq-{d}", .{std.time.nanoTimestamp()}) });
     defer {
         allocator.free(tmp_input);
-        std.fs.deleteTreeAbsolute(tmp_input) catch {};
+        std.fs.deleteFileAbsolute(tmp_input) catch {};
     }
 
     {
