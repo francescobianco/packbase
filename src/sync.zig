@@ -18,6 +18,7 @@ pub fn beginUpdateWindow(allocator: std.mem.Allocator, root: []const u8) !types.
     if (readIntFile(allocator, lock_path)) |started_at| {
         if (now - started_at < 300) {
             try writeIntFile(pending_path, now);
+            try writeUpdateStatus(allocator, root, "queued", started_at, now, &stats);
             stats.queued = true;
             return stats;
         }
@@ -29,16 +30,18 @@ pub fn beginUpdateWindow(allocator: std.mem.Allocator, root: []const u8) !types.
         if (delta < 15) {
             stats.rate_limited = true;
             stats.retry_after = 15 - delta;
+            try writeUpdateStatus(allocator, root, "cooldown", last_request, now, &stats);
             return stats;
         }
     } else |_| {}
 
     try writeIntFile(last_path, now);
     try writeIntFile(lock_path, now);
+    try writeUpdateStatus(allocator, root, "running", now, now, &stats);
     return stats;
 }
 
-pub fn finishUpdateWindow(allocator: std.mem.Allocator, root: []const u8) !void {
+pub fn finishUpdateWindow(allocator: std.mem.Allocator, root: []const u8, stats: ?*const types.SyncStats) !void {
     const state_dir = try ensureStateDir(allocator, root);
     defer allocator.free(state_dir);
 
@@ -49,6 +52,20 @@ pub fn finishUpdateWindow(allocator: std.mem.Allocator, root: []const u8) !void 
 
     std.fs.cwd().deleteFile(lock_path) catch {};
     std.fs.cwd().deleteFile(pending_path) catch {};
+    if (stats) |s| {
+        try writeUpdateStatus(allocator, root, "idle", std.time.timestamp(), std.time.timestamp(), s);
+    }
+}
+
+pub fn readUpdateStatusJson(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    const state_dir = try ensureStateDir(allocator, root);
+    defer allocator.free(state_dir);
+    const status_path = try std.fs.path.join(allocator, &.{ state_dir, "update.status.json" });
+    defer allocator.free(status_path);
+
+    const raw = try readOptionalFileAlloc(allocator, status_path, 16 * 1024) orelse
+        return allocator.dupe(u8, "{\"state\":\"idle\"}");
+    return raw;
 }
 
 pub fn listPackagesJson(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
@@ -159,6 +176,44 @@ fn ensureStateDir(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     const state_dir = try std.fs.path.join(allocator, &.{ root, ".packbase" });
     try shell.runCommand(allocator, &[_][]const u8{ "mkdir", "-p", state_dir });
     return state_dir;
+}
+
+fn writeUpdateStatus(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    state: []const u8,
+    started_at: i64,
+    updated_at: i64,
+    stats: *const types.SyncStats,
+) !void {
+    const state_dir = try ensureStateDir(allocator, root);
+    defer allocator.free(state_dir);
+    const status_path = try std.fs.path.join(allocator, &.{ state_dir, "update.status.json" });
+    defer allocator.free(status_path);
+
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{{\"state\":\"{s}\",\"started_at\":{d},\"updated_at\":{d},\"repos_scanned\":{d},\"packages_synced\":{d},\"tarballs_created\":{d},\"tarballs_present\":{d},\"default_seeded\":{s},\"source_changed\":{s},\"source_packages\":{d},\"source_added\":{d},\"source_updated\":{d},\"source_removed\":{d},\"retry_after\":{d},\"queued\":{s}}}\n",
+        .{
+            state,
+            started_at,
+            updated_at,
+            stats.repos_scanned,
+            stats.packages_synced,
+            stats.tarballs_created,
+            stats.tarballs_present,
+            if (stats.default_seeded) "true" else "false",
+            if (stats.source_changed) "true" else "false",
+            stats.source_packages,
+            stats.source_added,
+            stats.source_changed_count,
+            stats.source_removed,
+            stats.retry_after,
+            if (stats.queued) "true" else "false",
+        },
+    );
+    defer allocator.free(body);
+    try writeTextFile(status_path, body);
 }
 
 fn writeIntFile(path: []const u8, value: i64) !void {

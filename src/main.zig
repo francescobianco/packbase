@@ -71,7 +71,7 @@ fn handleConnection(
         return;
     }
     if (std.mem.eql(u8, path, "/api/info")) {
-        try handleInfo(allocator, connection, head_only);
+        try handleInfo(allocator, connection, root, head_only);
         return;
     }
     if (std.mem.eql(u8, path, "/")) {
@@ -203,6 +203,10 @@ fn handleUpdate(
 ) !void {
     var stats = try sync.beginUpdateWindow(allocator, root);
     if (stats.queued or stats.rate_limited) {
+        std.log.info("update skipped: {s} retry_after={d}", .{
+            if (stats.queued) "queued" else "cooldown",
+            stats.retry_after,
+        });
         const body = try std.fmt.allocPrint(
             allocator,
             "{{\"status\":\"{s}\",\"retry_after\":{d},\"queued\":{s}}}\n",
@@ -217,7 +221,8 @@ fn handleUpdate(
         try connection.stream.writeAll(body);
         return;
     }
-    defer sync.finishUpdateWindow(allocator, root) catch {};
+    std.log.info("update started source={s}", .{source_url});
+    defer sync.finishUpdateWindow(allocator, root, &stats) catch {};
 
     stats = sync.syncPackages(allocator, root) catch |err| {
         std.log.warn("sync failed: {s}", .{@errorName(err)});
@@ -244,6 +249,10 @@ fn handleUpdate(
     );
     defer allocator.free(body);
 
+    std.log.info(
+        "update completed repos={d} synced={d} created={d} source_changed={any} source_packages={d}",
+        .{ stats.repos_scanned, stats.packages_synced, stats.tarballs_created, stats.source_changed, stats.source_packages },
+    );
     try http.writeHeaders(connection, "200 OK", "application/json", body.len);
     try connection.stream.writeAll(body);
 }
@@ -264,13 +273,16 @@ fn handleList(
 fn handleInfo(
     allocator: std.mem.Allocator,
     connection: *std.net.Server.Connection,
+    root: []const u8,
     head_only: bool,
 ) !void {
     const release_id = std.mem.trimRight(u8, release_id_raw, "\r\n");
+    const update_status = try sync.readUpdateStatusJson(allocator, root);
+    defer allocator.free(update_status);
     const body = try std.fmt.allocPrint(
         allocator,
-        "{{\"service\":\"packbase\",\"release\":\"{s}\"}}\n",
-        .{release_id},
+        "{{\"service\":\"packbase\",\"release\":\"{s}\",\"update\":{s}}}\n",
+        .{ release_id, update_status },
     );
     defer allocator.free(body);
 
