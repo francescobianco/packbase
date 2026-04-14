@@ -388,13 +388,16 @@ fn handleSmartHttp(
     };
     defer allocator.free(repo_dir);
 
+    const git_protocol = http.findHeader(raw, "Git-Protocol") orelse "";
+    const use_v2 = std.mem.eql(u8, git_protocol, "version=2");
+
     if (std.mem.eql(u8, request.method, "GET")) {
-        try handleUploadPackAdvertise(allocator, connection, repo_dir, head_only);
+        try handleUploadPackAdvertise(allocator, connection, repo_dir, use_v2, head_only);
         return;
     } else if (std.mem.eql(u8, request.method, "POST")) {
         const content_type = http.findHeader(raw, "Content-Type") orelse "";
         if (std.mem.eql(u8, content_type, "application/x-git-upload-pack-request")) {
-            try handleUploadPackRequest(allocator, connection, repo_dir, raw, head_only);
+            try handleUploadPackRequest(allocator, connection, repo_dir, raw, use_v2, head_only);
             return;
         }
     }
@@ -595,17 +598,22 @@ fn handleUploadPackAdvertise(
     allocator: std.mem.Allocator,
     connection: *std.net.Server.Connection,
     repo_dir: []const u8,
+    use_v2: bool,
     head_only: bool,
 ) !void {
-    const output = shell.runCommandOutput(allocator, &[_][]const u8{
-        "git", "upload-pack", "--stateless-rpc", "--advertise-refs", repo_dir,
-    }) catch {
+    const argv = [_][]const u8{ "git", "upload-pack", "--stateless-rpc", "--advertise-refs", repo_dir };
+    const v2_env = [_][2][]const u8{.{ "GIT_PROTOCOL", "version=2" }};
+    const output = if (use_v2)
+        shell.runCommandOutputWithEnv(allocator, &argv, &v2_env)
+    else
+        shell.runCommandOutput(allocator, &argv);
+    const out = output catch {
         try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "upload-pack failed\n");
         return;
     };
-    defer allocator.free(output);
+    defer allocator.free(out);
 
-    const body_len = output.len + 34; // 30 bytes "001e# service=git-upload-pack\n" + 4 bytes "0000"
+    const body_len = out.len + 34; // 30 bytes "001e# service=git-upload-pack\n" + 4 bytes "0000"
     var headers: [128]u8 = undefined;
     const resp = try std.fmt.bufPrint(
         &headers,
@@ -616,7 +624,7 @@ fn handleUploadPackAdvertise(
     if (!head_only) {
         try connection.stream.writeAll("001e# service=git-upload-pack\n");
         try connection.stream.writeAll("0000");
-        try connection.stream.writeAll(output);
+        try connection.stream.writeAll(out);
     }
 }
 
@@ -625,6 +633,7 @@ fn handleUploadPackRequest(
     connection: *std.net.Server.Connection,
     repo_dir: []const u8,
     raw: []const u8,
+    use_v2: bool,
     head_only: bool,
 ) !void {
     const body = http.findBody(raw);
@@ -640,15 +649,19 @@ fn handleUploadPackRequest(
         try file.writeAll(body);
     }
 
-    const output = shell.runCommandOutputAlloc(allocator, &[_][]const u8{
-        "git", "upload-pack", "--stateless-rpc", repo_dir,
-    }, tmp_input) catch {
+    const argv = [_][]const u8{ "git", "upload-pack", "--stateless-rpc", repo_dir };
+    const v2_env = [_][2][]const u8{.{ "GIT_PROTOCOL", "version=2" }};
+    const output = if (use_v2)
+        shell.runCommandOutputAllocWithEnv(allocator, &argv, tmp_input, &v2_env)
+    else
+        shell.runCommandOutputAlloc(allocator, &argv, tmp_input);
+    const out = output catch {
         try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "upload-pack failed\n");
         return;
     };
-    defer allocator.free(output);
+    defer allocator.free(out);
 
-    const body_len = output.len;
+    const body_len = out.len;
     var headers: [128]u8 = undefined;
     const resp = try std.fmt.bufPrint(
         &headers,
@@ -658,6 +671,6 @@ fn handleUploadPackRequest(
     );
     try connection.stream.writeAll(resp);
     if (!head_only) {
-        try connection.stream.writeAll(output);
+        try connection.stream.writeAll(out);
     }
 }

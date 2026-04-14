@@ -48,6 +48,8 @@ update:
 	@docker compose build packbase
 	@echo "Restarting packbase..."
 	@docker compose up -d packbase
+	@echo "Removing cached git clones (keeping tarballs)..."
+	@docker compose exec -T packbase rm -rf /data/git || true
 	@echo "Showing logs..."
 	@docker compose logs --tail=20 packbase
 
