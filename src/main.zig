@@ -817,6 +817,10 @@ fn handleUploadPackAdvertise(
     use_v2: bool,
     head_only: bool,
 ) !void {
+    std.log.info(
+        "upload-pack advertise start repo={s} v2={any} head_only={any}",
+        .{ repo_dir, use_v2, head_only },
+    );
     const argv = [_][]const u8{ "git", "upload-pack", "--stateless-rpc", "--advertise-refs", repo_dir };
     const v2_env = [_][2][]const u8{.{ "GIT_PROTOCOL", "version=2" }};
     const output = if (use_v2)
@@ -842,6 +846,7 @@ fn handleUploadPackAdvertise(
         try connection.stream.writeAll("0000");
         try connection.stream.writeAll(out);
     }
+    std.log.info("upload-pack advertise done repo={s} bytes={d}", .{ repo_dir, out.len });
 }
 
 fn handleUploadPackRequest(
@@ -853,11 +858,18 @@ fn handleUploadPackRequest(
     head_only: bool,
 ) !void {
     const body = http.findBody(raw);
-    const tmp_input = try std.fs.path.join(allocator, &.{ "/tmp", try std.fmt.allocPrint(allocator, "gitreq-{d}", .{std.time.nanoTimestamp()}) });
+    const tmp_name = try std.fmt.allocPrint(allocator, "gitreq-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(tmp_name);
+    const tmp_input = try std.fs.path.join(allocator, &.{ "/tmp", tmp_name });
     defer {
         allocator.free(tmp_input);
         std.fs.deleteFileAbsolute(tmp_input) catch {};
     }
+
+    std.log.info(
+        "upload-pack request start repo={s} v2={any} head_only={any} body_bytes={d} tmp={s}",
+        .{ repo_dir, use_v2, head_only, body.len, tmp_input },
+    );
 
     {
         var file = try std.fs.createFileAbsolute(tmp_input, .{});
@@ -877,6 +889,8 @@ fn handleUploadPackRequest(
     };
     defer allocator.free(out);
 
+    std.log.info("upload-pack request git complete repo={s} bytes={d}", .{ repo_dir, out.len });
+
     var headers: [128]u8 = undefined;
     const resp = try std.fmt.bufPrint(
         &headers,
@@ -888,4 +902,5 @@ fn handleUploadPackRequest(
     if (!head_only) {
         try connection.stream.writeAll(out);
     }
+    std.log.info("upload-pack request done repo={s} bytes={d}", .{ repo_dir, out.len });
 }

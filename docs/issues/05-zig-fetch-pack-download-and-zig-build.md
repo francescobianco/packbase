@@ -87,9 +87,9 @@ Fields:
 
 ## Status
 
-- [x] `ls-refs` POST works (fixed in issue 03)
-- [x] pack-file fetch POST works (chunked decoding added in this issue)
-- [x] `zig fetch --save git+https://pb.yafb.net/lscolors` completes successfully
-- [x] package sources are populated in `~/.cache/zig/p/`
-- [x] `zig build` can resolve the dependency (standard Zig build flow)
-- [x] request logging added for future client-behaviour debugging
+- [ ] `ls-refs` POST works (fixed in issue 03)
+- [ ] pack-file fetch POST works (chunked decoding added in this issue)
+- [ ] `zig fetch --save git+https://pb.yafb.net/lscolors` completes successfully
+- [ ] package sources are populated in `~/.cache/zig/p/`
+- [ ] `zig build` can resolve the dependency (standard Zig build flow)
+- [ ] request logging added for future client-behaviour debugging

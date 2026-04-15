@@ -241,11 +241,13 @@ printf '%s' "$RELEASE_RESP" | grep -q '"source_repo_cloned":1'
 
 printf 'api/info: OK\n'
 
-# ── Phase 7: install the mirrored package with zig fetch --save ───────────────
-# The Zig runner resolves the package from packbase (not from GitHub), which is
-# the core promise of the service.
+# ── Phase 7: resolve a package through pseudo-git with zig fetch --save ───────
+# This covers the full smart-HTTP path (`info/refs` + `git-upload-pack`) that
+# previously broke during the pack download phase. The dependency is then used
+# by a real `zig build` so source resolution is exercised end-to-end.
 FETCH_DIR="$TMP_DIR/fetch-project"
 mkdir -p "$FETCH_DIR"
+mkdir -p "$FETCH_DIR/src"
 
 cat > "$FETCH_DIR/build.zig.zon" <<'ZON'
 .{
@@ -258,7 +260,34 @@ ZON
 
 cat > "$FETCH_DIR/build.zig" <<'ZIG'
 const std = @import("std");
-pub fn build(_: *std.Build) void {}
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const dep = b.dependency("hello_fixture", .{});
+    const module = dep.module("hello_fixture");
+
+    const exe = b.addExecutable(.{
+        .name = "smoke-app",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport(dep_name, module);
+    b.installArtifact(exe);
+}
+ZIG
+
+cat > "$FETCH_DIR/src/main.zig" <<'ZIG'
+const std = @import("std");
+const hello_fixture = @import("hello_fixture");
+
+pub fn main() !void {
+    try std.io.getStdOut().writer().print("{s}\n", .{hello_fixture.message()});
+}
 ZIG
 
 docker run --rm \
@@ -266,12 +295,23 @@ docker run --rm \
     -v "$FETCH_DIR:/work" \
     -w /work \
     "$ZIG_IMAGE" \
-    zig fetch --save "http://${CONTAINER_NAME}:8080${PKG_URL}"
+    zig fetch --save "git+http://${CONTAINER_NAME}:8080/hello"
 
 test -f "$FETCH_DIR/build.zig.zon"
-grep -q 'serde'  "$FETCH_DIR/build.zig.zon"
+grep -q 'hello_fixture' "$FETCH_DIR/build.zig.zon"
 grep -q '\.hash' "$FETCH_DIR/build.zig.zon"
 
-printf 'zig fetch --save: OK\n'
+FETCH_LOGS="$(docker logs "$CONTAINER_NAME" 2>&1)"
+printf '%s' "$FETCH_LOGS" | grep -q 'path=/hello/git-upload-pack te=chunked cl=-'
+
+docker run --rm \
+    --network "$NETWORK_NAME" \
+    -v "$FETCH_DIR:/work" \
+    -w /work \
+    "$ZIG_IMAGE" \
+    zig build
+
+printf 'zig fetch --save git+http://...: OK\n'
+printf 'zig build dependency resolution: OK\n'
 
 printf 'smoke test passed\n'

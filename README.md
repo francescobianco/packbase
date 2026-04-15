@@ -224,7 +224,9 @@ The smoke test:
 2. Starts packbase with a test token.
 3. Verifies the dumb-HTTP Git endpoint with `git clone`.
 4. Calls `POST /api/fetch` to mirror `serde.zig` from GitHub.
-5. Runs `zig fetch --save` against the packbase URL inside a container and confirms the `build.zig.zon` is updated with the hash.
+5. Runs `zig fetch --save git+http://.../hello` inside a container, confirming the pseudo-Git smart-HTTP path works through `git-upload-pack`.
+6. Checks the service logs for a chunked `git-upload-pack` request.
+7. Runs `zig build` against the fetched dependency so source resolution is verified, not just metadata fetch.
 
 To verify the short Git URL directly, run:
 
@@ -237,6 +239,12 @@ Or:
 ```bash
 PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0007 bash test/remote.sh
 ```
+
+The remote smoke now checks four things against the deployed instance behind Caddy:
+- root-level `git clone https://.../<repo>`
+- `zig fetch --save git+https://.../<repo>`
+- `zig build` against the fetched dependency
+- liveness after a second `zig fetch`, so regressions that panic after the first request are visible
 
 Artefacts survive in `test/tmp/` for inspection after the run.
 
