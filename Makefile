@@ -1,4 +1,14 @@
-.PHONY: start deploy test-smoke test-remote clean update logs status
+.PHONY: start deploy test-smoke test-remote clean update logs status prepare-prebuilt
+
+PREBUILT_BIN := dist/packbase-linux-x86_64
+
+prepare-prebuilt:
+	@echo "Building local prebuilt binary..."
+	@mkdir -p dist
+	@zig build -Doptimize=ReleaseSafe
+	@cp zig-out/bin/packbase "$(PREBUILT_BIN)"
+	@chmod +x "$(PREBUILT_BIN)"
+	@echo "Prebuilt ready: $(PREBUILT_BIN)"
 
 push:
 	@git config credential.helper 'cache --timeout=3600'
@@ -22,7 +32,7 @@ start:
 	fi
 	docker compose up -d
 
-deploy: push
+deploy: prepare-prebuilt push
 	@if [ ! -f .hosts ]; then \
 		echo "No .hosts file found."; \
 		echo "Create .hosts with one entry per line:  host=<h> user=<u> password=<p> pwd=<dir>"; \
@@ -35,6 +45,8 @@ deploy: push
 		P=$$(echo "$$line" | sed 's/.*password=\([^ ]*\).*/\1/'); \
 		D=$$(echo "$$line" | sed 's/.*pwd=\([^ ]*\).*/\1/'); \
 		echo "→ $$U@$$H:$$D"; \
+		sshpass -p "$$P" ssh -o StrictHostKeyChecking=no "$$U@$$H" "mkdir -p '$$D/dist'"; \
+		sshpass -p "$$P" scp -o StrictHostKeyChecking=no "$(PREBUILT_BIN)" "$$U@$$H:$$D/dist/packbase-linux-x86_64"; \
 		sshpass -p "$$P" ssh -o StrictHostKeyChecking=no "$$U@$$H" "cd '$$D' && make update"; \
 	done < .hosts
 
@@ -44,7 +56,13 @@ update:
 	@echo "Using RELEASE_ID:"
 	@cat src/RELEASE_ID
 	@echo "Building packbase..."
-	@docker compose build packbase
+	@if [ -x "$(PREBUILT_BIN)" ]; then \
+		echo "Using prebuilt Dockerfile with $(PREBUILT_BIN)"; \
+		PACKBASE_DOCKERFILE=Dockerfile.prebuilt docker compose build packbase; \
+	else \
+		echo "No prebuilt binary found, falling back to source build"; \
+		docker compose build packbase; \
+	fi
 	@echo "Restarting packbase and caddy..."
 	@docker compose up -d --force-recreate packbase caddy
 	@echo "Removing cached git clones (keeping tarballs)..."

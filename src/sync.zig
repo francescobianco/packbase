@@ -108,7 +108,74 @@ pub fn listPackagesJson(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     }
     try body.appendSlice(allocator, "]}\n");
 
-    return body.toOwnedSlice(allocator);
+    return try body.toOwnedSlice(allocator);
+}
+
+pub fn checkPackageJson(allocator: std.mem.Allocator, root: []const u8, package_name: []const u8) !?[]u8 {
+    var local_names = try collectLocalPackageNames(allocator, root);
+    defer {
+        for (local_names.items) |name| allocator.free(name);
+        local_names.deinit(allocator);
+    }
+
+    var registered_names = try collectRegisteredPackageNames(allocator, root);
+    defer {
+        for (registered_names.items) |name| allocator.free(name);
+        registered_names.deinit(allocator);
+    }
+
+    const local = containsName(local_names.items, package_name);
+    const registered = containsName(registered_names.items, package_name);
+    const available = local or registered;
+    if (!available) return null;
+
+    const tarball_dir = try std.fs.path.join(allocator, &.{ root, "p", package_name, "tag" });
+    defer allocator.free(tarball_dir);
+    const tarball_dir_present = accessExists(tarball_dir);
+
+    var tarballs = try collectTarballTags(allocator, tarball_dir);
+    defer {
+        for (tarballs.items) |tag| allocator.free(tag);
+        tarballs.deinit(allocator);
+    }
+    std.mem.sort([]u8, tarballs.items, {}, sortStringAsc);
+
+    const latest_tag = if (tarballs.items.len == 0) null else tarballs.items[tarballs.items.len - 1];
+    const smart_http_ready = tarballs.items.len != 0;
+    const healthy = local and tarballs.items.len != 0;
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+
+    try body.appendSlice(allocator, "{\"package\":");
+    try appendJsonString(allocator, &body, package_name);
+    try body.appendSlice(allocator, ",\"available\":");
+    try body.appendSlice(allocator, if (available) "true" else "false");
+    try body.appendSlice(allocator, ",\"registered\":");
+    try body.appendSlice(allocator, if (registered) "true" else "false");
+    try body.appendSlice(allocator, ",\"local\":");
+    try body.appendSlice(allocator, if (local) "true" else "false");
+    try body.appendSlice(allocator, ",\"tarball_dir_present\":");
+    try body.appendSlice(allocator, if (tarball_dir_present) "true" else "false");
+    try body.writer(allocator).print(",\"tarball_count\":{d}", .{tarballs.items.len});
+    try body.appendSlice(allocator, ",\"latest_tag\":");
+    if (latest_tag) |tag| {
+        try appendJsonString(allocator, &body, tag);
+    } else {
+        try body.appendSlice(allocator, "null");
+    }
+    try body.appendSlice(allocator, ",\"tarballs\":[");
+    for (tarballs.items, 0..) |tag, index| {
+        if (index != 0) try body.append(allocator, ',');
+        try appendJsonString(allocator, &body, tag);
+    }
+    try body.appendSlice(allocator, "],\"smart_http_ready\":");
+    try body.appendSlice(allocator, if (smart_http_ready) "true" else "false");
+    try body.appendSlice(allocator, ",\"healthy\":");
+    try body.appendSlice(allocator, if (healthy) "true" else "false");
+    try body.appendSlice(allocator, "}\n");
+
+    return try body.toOwnedSlice(allocator);
 }
 
 pub fn syncPackages(allocator: std.mem.Allocator, root: []const u8) !types.SyncStats {
@@ -672,6 +739,40 @@ fn collectLocalPackageNames(allocator: std.mem.Allocator, root: []const u8) !std
         try entries.append(allocator, try allocator.dupe(u8, entry.name));
     }
     return entries;
+}
+
+fn collectTarballTags(allocator: std.mem.Allocator, tarball_dir: []const u8) !std.ArrayList([]u8) {
+    var tags = std.ArrayList([]u8).empty;
+    errdefer {
+        for (tags.items) |tag| allocator.free(tag);
+        tags.deinit(allocator);
+    }
+
+    var dir = std.fs.cwd().openDir(tarball_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return tags,
+        else => return err,
+    };
+    defer dir.close();
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".tar.gz")) continue;
+        try tags.append(allocator, try allocator.dupe(u8, entry.name[0 .. entry.name.len - 7]));
+    }
+    return tags;
+}
+
+fn containsName(names: []const []u8, needle: []const u8) bool {
+    for (names) |name| {
+        if (std.mem.eql(u8, name, needle)) return true;
+    }
+    return false;
+}
+
+fn accessExists(path: []const u8) bool {
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
 }
 
 fn collectRegisteredPackageNames(allocator: std.mem.Allocator, root: []const u8) !std.ArrayList([]u8) {

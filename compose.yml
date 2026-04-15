@@ -1,7 +1,9 @@
 services:
 
   packbase:
-    build: .
+    build:
+      context: .
+      dockerfile: ${PACKBASE_DOCKERFILE:-Dockerfile}
     command:
       - /bin/sh
       - -lc

@@ -145,6 +145,39 @@ Restituisce:
 }
 ```
 
+### `GET /api/check/<package>`
+
+Restituisce un controllo rapido sull'integrita operativa del pacchetto:
+- se il pacchetto e visibile all'istanza
+- se e registrato nel source catalog
+- se e materializzato localmente
+- se esistono tarball pubblicabili sotto `/p/<pkg>/tag/`
+- se il path pseudo-Git puo essere servito a partire dai tarball presenti, senza richiedere un mirror Git persistente
+
+**Response `200`**
+```json
+{
+  "package": "hello",
+  "available": true,
+  "registered": false,
+  "local": true,
+  "tarball_dir_present": true,
+  "tarball_count": 1,
+  "latest_tag": "v0.1.0",
+  "tarballs": ["v0.1.0"],
+  "smart_http_ready": true,
+  "healthy": true
+}
+```
+
+**Response `404`**
+```json
+{
+  "status": "not_found",
+  "package": "missing-package"
+}
+```
+
 ### `GET /api/info`
 
 Restituisce metadati dell'istanza, incluso l'identificativo di rilascio della
@@ -240,11 +273,13 @@ Or:
 PACKBASE_REMOTE_DOMAIN=pb.yafb.net PACKBASE_EXPECTED_RELEASE=r0007 bash test/remote.sh
 ```
 
-The remote smoke now checks four things against the deployed instance behind Caddy:
+The remote smoke now checks these things against the deployed instance behind Caddy:
 - root-level `git clone https://.../<repo>`
+- `/api/check/<repo>` for integrity metadata
 - `zig fetch --save git+https://.../<repo>`
 - `zig build` against the fetched dependency
 - liveness after a second `zig fetch`, so regressions that panic after the first request are visible
+- batch installation of 10 packages selected from `/api/list` and validated with `/api/check/<pkg>`
 
 Artefacts survive in `test/tmp/` for inspection after the run.
 

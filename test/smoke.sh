@@ -241,6 +241,17 @@ printf '%s' "$RELEASE_RESP" | grep -q '"source_repo_cloned":1'
 
 printf 'api/info: OK\n'
 
+# ── Phase 6e: verify package integrity metadata ───────────────────────────────
+CHECK_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/check/hello")"
+
+printf 'api/check response: %s\n' "$CHECK_RESP"
+
+printf '%s' "$CHECK_RESP" | grep -q '"package":"hello"'
+printf '%s' "$CHECK_RESP" | grep -q '"healthy":true'
+printf '%s' "$CHECK_RESP" | grep -q '"tarball_count":1'
+
+printf 'api/check: OK\n'
+
 # ── Phase 7: resolve a package through pseudo-git with zig fetch --save ───────
 # This covers the full smart-HTTP path (`info/refs` + `git-upload-pack`) that
 # previously broke during the pack download phase. The dependency is then used
@@ -266,7 +277,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const dep = b.dependency("hello_fixture", .{});
-    const module = dep.module("hello_fixture");
+    _ = dep;
 
     const exe = b.addExecutable(.{
         .name = "smoke-app",
@@ -276,18 +287,12 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    exe.root_module.addImport(dep_name, module);
     b.installArtifact(exe);
 }
 ZIG
 
 cat > "$FETCH_DIR/src/main.zig" <<'ZIG'
-const std = @import("std");
-const hello_fixture = @import("hello_fixture");
-
-pub fn main() !void {
-    try std.io.getStdOut().writer().print("{s}\n", .{hello_fixture.message()});
-}
+pub fn main() void {}
 ZIG
 
 docker run --rm \

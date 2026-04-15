@@ -1,0 +1,14 @@
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates curl git
+
+COPY dist/packbase-linux-x86_64 /usr/local/bin/packbase
+RUN chmod +x /usr/local/bin/packbase
+RUN mkdir -p /var/lib/packbase/public
+
+ENV PACKBASE_ROOT=/var/lib/packbase/public
+ENV PACKBASE_PORT=8080
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/packbase"]

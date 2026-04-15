@@ -172,6 +172,10 @@ fn handleConnection(
         try handleList(allocator, connection, root, head_only);
         return;
     }
+    if (std.mem.startsWith(u8, path, "/api/check/")) {
+        try handleCheckPackage(allocator, connection, root, path["/api/check/".len..], head_only);
+        return;
+    }
     if (std.mem.eql(u8, path, "/api/info")) {
         try handleInfo(allocator, connection, root, head_only);
         return;
@@ -527,6 +531,35 @@ fn handleInfo(
         "{{\"service\":\"packbase\",\"release\":\"{s}\",\"update\":{s}}}\n",
         .{ release_id, update_status },
     );
+    defer allocator.free(body);
+
+    try http.writeHeaders(connection, "200 OK", "application/json", body.len);
+    if (!head_only) try connection.stream.writeAll(body);
+}
+
+fn handleCheckPackage(
+    allocator: std.mem.Allocator,
+    connection: *std.net.Server.Connection,
+    root: []const u8,
+    package_name: []const u8,
+    head_only: bool,
+) !void {
+    if (package_name.len == 0 or std.mem.indexOfScalar(u8, package_name, '/') != null) {
+        try http.sendSimpleResponse(connection, "400 Bad Request", "text/plain", "invalid package name\n");
+        return;
+    }
+
+    const body = (try sync.checkPackageJson(allocator, root, package_name)) orelse {
+        const not_found = try std.fmt.allocPrint(
+            allocator,
+            "{{\"status\":\"not_found\",\"package\":\"{s}\"}}\n",
+            .{package_name},
+        );
+        defer allocator.free(not_found);
+        try http.writeHeaders(connection, "404 Not Found", "application/json", not_found.len);
+        if (!head_only) try connection.stream.writeAll(not_found);
+        return;
+    };
     defer allocator.free(body);
 
     try http.writeHeaders(connection, "200 OK", "application/json", body.len);
