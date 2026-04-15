@@ -62,6 +62,7 @@ pub const SyncStats = struct {
     queued: bool = false,
     packages_total: usize = 0,
     packages_probed: usize = 0,
+    disk_free: u64 = 0,
 };
 
 pub const PackageTagInfo = struct {

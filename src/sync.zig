@@ -6,6 +6,32 @@ const release_id_raw = @embedFile("RELEASE_ID");
 
 const ENABLE_ATOMIC_WRITES = true;
 
+fn formatBytesHumanReadable(bytes: u64) [16]u8 {
+    const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB" };
+    var value: f64 = @floatFromInt(bytes);
+    var unit_index: usize = 0;
+    while (value >= 1024 and unit_index < units.len - 1) {
+        value /= 1024;
+        unit_index += 1;
+    }
+    var buf: [16]u8 = undefined;
+    if (unit_index == 0) {
+        _ = std.fmt.bufPrint(&buf, "{d} {s}", .{ @as(u64, @intFromFloat(value)), units[unit_index] }) catch unreachable;
+    } else {
+        _ = std.fmt.bufPrint(&buf, "{d:.1} {s}", .{ value, units[unit_index] }) catch unreachable;
+    }
+    return buf;
+}
+
+fn getDiskFreeSpace(allocator: std.mem.Allocator, root: []const u8) u64 {
+    const result = shell.runCommandOutput(allocator, &[_][]const u8{ "df", "-B1", "--output=avail", root }) catch return 0;
+    defer allocator.free(result);
+    var lines = std.mem.splitScalar(u8, result, '\n');
+    _ = lines.next();
+    const second_line = lines.next() orelse return 0;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, second_line, " \n"), 10) catch 0;
+}
+
 pub fn beginUpdateWindow(allocator: std.mem.Allocator, root: []const u8) !types.SyncStats {
     var stats = types.SyncStats{};
     const now = std.time.timestamp();
@@ -56,8 +82,11 @@ pub fn finishUpdateWindow(allocator: std.mem.Allocator, root: []const u8, stats:
 
     std.fs.cwd().deleteFile(lock_path) catch {};
     std.fs.cwd().deleteFile(pending_path) catch {};
+
     if (stats) |s| {
-        try writeUpdateStatus(allocator, root, "idle", std.time.timestamp(), std.time.timestamp(), s);
+        var mutable_stats = s.*;
+        mutable_stats.disk_free = getDiskFreeSpace(allocator, root);
+        try writeUpdateStatus(allocator, root, "idle", std.time.timestamp(), std.time.timestamp(), &mutable_stats);
     }
 }
 
@@ -749,9 +778,12 @@ fn writeUpdateStatus(
     const status_path = try std.fs.path.join(allocator, &.{ state_dir, "update.status.json" });
     defer allocator.free(status_path);
 
+    const disk_free_hr = formatBytesHumanReadable(stats.disk_free);
+    const disk_free_str = std.mem.trim(u8, &disk_free_hr, " ");
+
     const base_body = try std.fmt.allocPrint(
         allocator,
-        "{{\"state\":\"{s}\",\"started_at\":{d},\"updated_at\":{d},\"repos_scanned\":{d},\"packages_synced\":{d},\"tarballs_created\":{d},\"tarballs_present\":{d},\"default_seeded\":{s},\"source_changed\":{s},\"source_packages\":{d},\"source_added\":{d},\"source_updated\":{d},\"source_removed\":{d},\"retry_after\":{d},\"queued\":{s}}}\n",
+        "{{\"state\":\"{s}\",\"started_at\":{d},\"updated_at\":{d},\"repos_scanned\":{d},\"packages_synced\":{d},\"tarballs_created\":{d},\"tarballs_present\":{d},\"default_seeded\":{s},\"source_changed\":{s},\"source_packages\":{d},\"source_added\":{d},\"source_updated\":{d},\"source_removed\":{d},\"retry_after\":{d},\"queued\":{s},\"disk_free\":\"{s}\"}}\n",
         .{
             state,
             started_at,
@@ -768,6 +800,7 @@ fn writeUpdateStatus(
             stats.source_removed,
             stats.retry_after,
             if (stats.queued) "true" else "false",
+            disk_free_str,
         },
     );
     defer allocator.free(base_body);
