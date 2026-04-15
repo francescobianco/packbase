@@ -45,7 +45,7 @@ deploy: prepare-prebuilt push
 		P=$$(echo "$$line" | sed 's/.*password=\([^ ]*\).*/\1/'); \
 		D=$$(echo "$$line" | sed 's/.*pwd=\([^ ]*\).*/\1/'); \
 		echo "→ $$U@$$H:$$D"; \
-		sshpass -p "$$P" ssh -o StrictHostKeyChecking=no "$$U@$$H" "cd '$$D' && make update"; \
+		sshpass -p "$$P" ssh -o StrictHostKeyChecking=no "$$U@$$H" "cd '$$D' && mkdir -p dist && rm -f '$(PREBUILT_BIN)' && git checkout -- '$(PREBUILT_BIN)' 2>/dev/null || true && make update"; \
 	done < .hosts
 
 update:
