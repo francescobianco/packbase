@@ -45,13 +45,14 @@ deploy: prepare-prebuilt push
 		P=$$(echo "$$line" | sed 's/.*password=\([^ ]*\).*/\1/'); \
 		D=$$(echo "$$line" | sed 's/.*pwd=\([^ ]*\).*/\1/'); \
 		echo "→ $$U@$$H:$$D"; \
-		sshpass -p "$$P" ssh -o StrictHostKeyChecking=no "$$U@$$H" "mkdir -p '$$D/dist'"; \
-		sshpass -p "$$P" scp -o StrictHostKeyChecking=no "$(PREBUILT_BIN)" "$$U@$$H:$$D/dist/packbase-linux-x86_64"; \
 		sshpass -p "$$P" ssh -o StrictHostKeyChecking=no "$$U@$$H" "cd '$$D' && make update"; \
 	done < .hosts
 
 update:
 	@echo "Pulling latest changes..."
+	@mkdir -p dist
+	@rm -f "$(PREBUILT_BIN)"
+	@git checkout -- "$(PREBUILT_BIN)" 2>/dev/null || true
 	@git pull
 	@echo "Using RELEASE_ID:"
 	@cat src/RELEASE_ID
