@@ -521,6 +521,18 @@ pub fn syncSourceCatalog(
     return new_records;
 }
 
+fn packageHasTarballs(root: []const u8, package_name: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tag_dir = std.fmt.bufPrint(&buf, "{s}/p/{s}/tag", .{ root, package_name }) catch return false;
+    var td = std.fs.openDirAbsolute(tag_dir, .{ .iterate = true }) catch return false;
+    defer td.close();
+    var iter = td.iterate();
+    while (iter.next() catch return false) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".tar.gz")) return true;
+    }
+    return false;
+}
+
 pub fn syncSourceRepos(
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -530,7 +542,10 @@ pub fn syncSourceRepos(
 ) !void {
     _ = refresh_existing;
     for (records) |record| {
-        if (record.fresh) continue;
+        // Skip packages whose source catalog entry is unchanged AND already have tarballs.
+        // If a package is marked fresh but has no tarballs, force a re-sync: the previous
+        // attempt likely failed silently and the timestamp cache should not protect it.
+        if (record.fresh and packageHasTarballs(root, record.package_name)) continue;
         var result = syncSingleSourceRecord(allocator, root, record, stats) catch |err| {
             stats.source_repo_failed += 1;
             std.log.warn("source package sync failed package={s} error={s}", .{ record.package_name, @errorName(err) });

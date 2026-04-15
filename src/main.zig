@@ -176,6 +176,10 @@ fn handleConnection(
             try handleUpdate(allocator, connection, root, source_url);
             return;
         }
+        if (std.mem.eql(u8, path, "/api/check")) {
+            try handleCheckPackagePost(allocator, connection, root, raw, head_only);
+            return;
+        }
     }
 
     if (http.isSmartHttpRequest(path)) {
@@ -492,6 +496,27 @@ fn handleStatus(
 
     try http.writeHeaders(connection, "200 OK", "application/json", body.len);
     if (!head_only) try connection.stream.writeAll(body);
+}
+
+fn handleCheckPackagePost(
+    allocator: std.mem.Allocator,
+    connection: *std.net.Server.Connection,
+    root: []const u8,
+    raw: []const u8,
+    head_only: bool,
+) !void {
+    const body_raw = http.findBody(raw);
+    if (body_raw.len == 0) {
+        try http.sendSimpleResponse(connection, "400 Bad Request", "text/plain", "empty body\n");
+        return;
+    }
+    const Payload = struct { package: []const u8 };
+    const parsed = std.json.parseFromSlice(Payload, allocator, body_raw, .{}) catch {
+        try http.sendSimpleResponse(connection, "400 Bad Request", "text/plain", "invalid json\n");
+        return;
+    };
+    defer parsed.deinit();
+    try handleCheckPackage(allocator, connection, root, parsed.value.package, head_only);
 }
 
 fn handleCheckPackage(

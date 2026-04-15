@@ -260,6 +260,11 @@ pub fn sendLandingPage(allocator: std.mem.Allocator, connection: *std.net.Server
         \\          <td>Return metadata for a specific hosted package.</td>
         \\        </tr>
         \\        <tr>
+        \\          <td><span class="method post">POST</span></td>
+        \\          <td><code>/api/check</code></td>
+        \\          <td>Return health and metadata for a package. Body: <code>{"package":"&lt;name&gt;"}</code></td>
+        \\        </tr>
+        \\        <tr>
         \\          <td><span class="method get">GET</span></td>
         \\          <td><code>/&lt;repo&gt;/&#8230;</code></td>
         \\          <td>Serve tarballs and pseudo-git endpoints for hosted packages.</td>
