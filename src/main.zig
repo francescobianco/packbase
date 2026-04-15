@@ -201,7 +201,7 @@ fn handleConnection(
         return;
     }
     if (std.mem.eql(u8, path, "/")) {
-        try http.sendLandingPage(connection, head_only);
+        try http.sendLandingPage(allocator, connection, head_only, source_url);
         return;
     }
 

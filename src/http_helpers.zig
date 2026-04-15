@@ -137,8 +137,8 @@ pub fn isSmartHttpRequest(path: []const u8) bool {
     return false;
 }
 
-pub fn sendLandingPage(connection: *std.net.Server.Connection, head_only: bool) !void {
-    const body =
+pub fn sendLandingPage(allocator: std.mem.Allocator, connection: *std.net.Server.Connection, head_only: bool, source_url: []const u8) !void {
+    const static_part =
         \\<!DOCTYPE html>
         \\<html lang="en">
         \\<head>
@@ -261,13 +261,22 @@ pub fn sendLandingPage(connection: *std.net.Server.Connection, head_only: bool) 
         \\        </tr>
         \\      </tbody>
         \\    </table>
-        \\  </main>
-        \\  <footer>
-        \\    <a href="https://github.com/francescobianco/packbase">github.com/francescobianco/packbase</a>
-        \\  </footer>
-        \\</body>
-        \\</html>
+        \\    <h2 style="font-size:1rem;margin:2rem 0 0.5rem;">Connected sources</h2>
+        \\    <table>
+        \\      <thead>
+        \\        <tr><th>Variable</th><th>Value</th></tr>
+        \\      </thead>
+        \\      <tbody>
+        \\        <tr>
+        \\          <td><code>PACKBASE_SOURCE</code></td>
+        \\          <td><code>
     ;
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{s}{s}</code></td>\n        </tr>\n      </tbody>\n    </table>\n  </main>\n  <footer>\n    <a href=\"https://github.com/francescobianco/packbase\">github.com/francescobianco/packbase</a>\n  </footer>\n</body>\n</html>\n",
+        .{ static_part, source_url },
+    );
+    defer allocator.free(body);
     try writeHeaders(connection, "200 OK", "text/html; charset=utf-8", body.len);
     if (!head_only) try connection.stream.writeAll(body);
 }
