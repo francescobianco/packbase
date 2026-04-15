@@ -55,3 +55,31 @@ pub const SyncStats = struct {
     retry_after: i64 = 0,
     queued: bool = false,
 };
+
+pub const PackageTagInfo = struct {
+    tag: []const u8,
+    size_bytes: u64 = 0,
+};
+
+pub const PackageInfo = struct {
+    package: []const u8,
+    available: bool = false,
+    registered: bool = false,
+    local: bool = false,
+    tarball_dir_present: bool = false,
+    tarball_count: usize = 0,
+    latest_tag: ?[]const u8 = null,
+    latest_size_bytes: u64 = 0,
+    size_bytes: u64 = 0,
+    tarballs: []PackageTagInfo = &.{},
+    smart_http_ready: bool = false,
+    pseudo_git_fetchable: bool = false,
+    fetch_probe_commit: ?[]const u8 = null,
+    fetch_probe_error: ?[]const u8 = null,
+    healthy: bool = false,
+    updated_at: i64 = 0,
+};
+
+pub const PackageInfoSnapshot = struct {
+    packages: []PackageInfo = &.{},
+};

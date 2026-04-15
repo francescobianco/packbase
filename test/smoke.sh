@@ -241,16 +241,17 @@ printf '%s' "$RELEASE_RESP" | grep -q '"source_repo_cloned":1'
 
 printf 'api/info: OK\n'
 
-# ── Phase 6e: verify package integrity metadata ───────────────────────────────
-CHECK_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/check/hello")"
+# ── Phase 6e: verify persisted package info metadata ──────────────────────────
+CHECK_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/info/hello")"
 
-printf 'api/check response: %s\n' "$CHECK_RESP"
+printf 'api/info/hello response: %s\n' "$CHECK_RESP"
 
 printf '%s' "$CHECK_RESP" | grep -q '"package":"hello"'
 printf '%s' "$CHECK_RESP" | grep -q '"healthy":true'
 printf '%s' "$CHECK_RESP" | grep -q '"tarball_count":1'
+printf '%s' "$CHECK_RESP" | grep -Eq '"size_bytes":[1-9][0-9]*'
 
-printf 'api/check: OK\n'
+printf 'api/info/<package>: OK\n'
 
 # ── Phase 7: resolve a package through pseudo-git with zig fetch --save ───────
 # This covers the full smart-HTTP path (`info/refs` + `git-upload-pack`) that

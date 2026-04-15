@@ -11,19 +11,6 @@ const UpdateWorkerArgs = struct {
     source_url: []u8,
 };
 
-const PackageCheckBasic = struct {
-    package: []const u8,
-    available: bool,
-    registered: bool,
-    local: bool,
-    tarball_dir_present: bool,
-    tarball_count: usize,
-    latest_tag: ?[]const u8 = null,
-    tarballs: []const []const u8 = &.{},
-    smart_http_ready: bool,
-    healthy: bool,
-};
-
 const FetchProbeResult = struct {
     pseudo_git_fetchable: bool,
     commit: ?[]u8 = null,
@@ -195,6 +182,10 @@ fn handleConnection(
 
     if (std.mem.eql(u8, path, "/api/list")) {
         try handleList(allocator, connection, root, head_only);
+        return;
+    }
+    if (std.mem.startsWith(u8, path, "/api/info/")) {
+        try handlePackageInfo(allocator, connection, root, path["/api/info/".len..], head_only);
         return;
     }
     if (std.mem.startsWith(u8, path, "/api/check/")) {
@@ -514,8 +505,46 @@ fn updateWorker(args: *UpdateWorkerArgs) void {
     stats.tarballs_present = local_stats.tarballs_present;
     stats.default_seeded = local_stats.default_seeded;
 
+    var package_infos = sync.collectPackageInfos(allocator, root) catch |err| {
+        std.log.warn("package info collection failed: {s}", .{@errorName(err)});
+        return;
+    };
+    defer sync.freePackageInfoList(allocator, &package_infos);
+
+    const updated_at = std.time.timestamp();
+    for (package_infos.items) |*info| {
+        info.updated_at = updated_at;
+        info.smart_http_ready = info.tarball_count != 0;
+
+        var probe = probePseudoGitFetchability(allocator, root, info.package, info.local) catch |err| {
+            std.log.warn("fetch probe failed package={s} error={s}", .{ info.package, @errorName(err) });
+            continue;
+        };
+        defer probe.deinit(allocator);
+
+        info.pseudo_git_fetchable = probe.pseudo_git_fetchable;
+        if (probe.commit) |commit| {
+            info.fetch_probe_commit = allocator.dupe(u8, commit) catch |err| {
+                std.log.warn("commit copy failed package={s} error={s}", .{ info.package, @errorName(err) });
+                continue;
+            };
+        }
+        if (probe.probe_error) |probe_error| {
+            info.fetch_probe_error = allocator.dupe(u8, probe_error) catch |err| {
+                std.log.warn("probe error copy failed package={s} error={s}", .{ info.package, @errorName(err) });
+                continue;
+            };
+        }
+        info.healthy = info.local and info.tarball_count != 0 and info.pseudo_git_fetchable;
+    }
+
+    sync.writePackageInfoSnapshot(allocator, root, package_infos.items) catch |err| {
+        std.log.warn("package info snapshot write failed: {s}", .{@errorName(err)});
+        return;
+    };
+
     std.log.info(
-        "update completed repos={d} synced={d} created={d} source_changed={any} source_packages={d} cloned={d} updated={d} failed={d}",
+        "update completed repos={d} synced={d} created={d} source_changed={any} source_packages={d} cloned={d} updated={d} failed={d} package_infos={d}",
         .{
             stats.repos_scanned,
             stats.packages_synced,
@@ -525,6 +554,7 @@ fn updateWorker(args: *UpdateWorkerArgs) void {
             stats.source_repo_cloned,
             stats.source_repo_updated,
             stats.source_repo_failed,
+            package_infos.items.len,
         },
     );
 }
@@ -574,7 +604,18 @@ fn handleCheckPackage(
         return;
     }
 
-    const basic_body = (try sync.checkPackageJson(allocator, root, package_name)) orelse {
+    const body = sync.readPackageInfoJson(allocator, root, package_name) catch |err| switch (err) {
+        error.FileNotFound => {
+            try http.sendSimpleResponse(
+                connection,
+                "503 Service Unavailable",
+                "text/plain",
+                "package info unavailable; run /api/update first\n",
+            );
+            return;
+        },
+        else => return err,
+    } orelse {
         const not_found = try std.fmt.allocPrint(
             allocator,
             "{{\"status\":\"not_found\",\"package\":\"{s}\"}}\n",
@@ -585,63 +626,20 @@ fn handleCheckPackage(
         if (!head_only) try connection.stream.writeAll(not_found);
         return;
     };
-    defer allocator.free(basic_body);
+    defer allocator.free(body);
 
-    const parsed = try std.json.parseFromSlice(PackageCheckBasic, allocator, basic_body, .{});
-    defer parsed.deinit();
+    try http.writeHeaders(connection, "200 OK", "application/json", body.len);
+    if (!head_only) try connection.stream.writeAll(body);
+}
 
-    var probe = try probePseudoGitFetchability(allocator, root, parsed.value.package, parsed.value.local);
-    defer probe.deinit(allocator);
-
-    const healthy = parsed.value.local and parsed.value.tarball_count != 0 and probe.pseudo_git_fetchable;
-
-    var body = std.ArrayList(u8).empty;
-    defer body.deinit(allocator);
-
-    try body.appendSlice(allocator, "{\"package\":");
-    try appendJsonStringLocal(allocator, &body, parsed.value.package);
-    try body.appendSlice(allocator, ",\"available\":");
-    try body.appendSlice(allocator, if (parsed.value.available) "true" else "false");
-    try body.appendSlice(allocator, ",\"registered\":");
-    try body.appendSlice(allocator, if (parsed.value.registered) "true" else "false");
-    try body.appendSlice(allocator, ",\"local\":");
-    try body.appendSlice(allocator, if (parsed.value.local) "true" else "false");
-    try body.appendSlice(allocator, ",\"tarball_dir_present\":");
-    try body.appendSlice(allocator, if (parsed.value.tarball_dir_present) "true" else "false");
-    try body.writer(allocator).print(",\"tarball_count\":{d}", .{parsed.value.tarball_count});
-    try body.appendSlice(allocator, ",\"latest_tag\":");
-    if (parsed.value.latest_tag) |tag| {
-        try appendJsonStringLocal(allocator, &body, tag);
-    } else {
-        try body.appendSlice(allocator, "null");
-    }
-    try body.appendSlice(allocator, ",\"tarballs\":[");
-    for (parsed.value.tarballs, 0..) |tag, index| {
-        if (index != 0) try body.append(allocator, ',');
-        try appendJsonStringLocal(allocator, &body, tag);
-    }
-    try body.appendSlice(allocator, "],\"smart_http_ready\":");
-    try body.appendSlice(allocator, if (parsed.value.smart_http_ready) "true" else "false");
-    try body.appendSlice(allocator, ",\"pseudo_git_fetchable\":");
-    try body.appendSlice(allocator, if (probe.pseudo_git_fetchable) "true" else "false");
-    try body.appendSlice(allocator, ",\"fetch_probe_commit\":");
-    if (probe.commit) |commit| {
-        try appendJsonStringLocal(allocator, &body, commit);
-    } else {
-        try body.appendSlice(allocator, "null");
-    }
-    try body.appendSlice(allocator, ",\"fetch_probe_error\":");
-    if (probe.probe_error) |probe_error| {
-        try appendJsonStringLocal(allocator, &body, probe_error);
-    } else {
-        try body.appendSlice(allocator, "null");
-    }
-    try body.appendSlice(allocator, ",\"healthy\":");
-    try body.appendSlice(allocator, if (healthy) "true" else "false");
-    try body.appendSlice(allocator, "}\n");
-
-    try http.writeHeaders(connection, "200 OK", "application/json", body.items.len);
-    if (!head_only) try connection.stream.writeAll(body.items);
+fn handlePackageInfo(
+    allocator: std.mem.Allocator,
+    connection: *std.net.Server.Connection,
+    root: []const u8,
+    package_name: []const u8,
+    head_only: bool,
+) !void {
+    try handleCheckPackage(allocator, connection, root, package_name, head_only);
 }
 
 fn probePseudoGitFetchability(
@@ -652,16 +650,15 @@ fn probePseudoGitFetchability(
 ) !FetchProbeResult {
     if (!local) return .{ .pseudo_git_fetchable = false, .probe_error = try allocator.dupe(u8, "package_not_local") };
 
-    const repo_dir = (try resolveRepoDir(allocator, root, package_name)) orelse {
-        return .{ .pseudo_git_fetchable = false, .probe_error = try allocator.dupe(u8, "repo_unavailable") };
-    };
-    defer allocator.free(repo_dir);
-
-    const commit_raw = shell.runCommandOutput(allocator, &.{ "git", "-C", repo_dir, "rev-parse", "HEAD" }) catch |err| {
-        return .{ .pseudo_git_fetchable = false, .probe_error = try allocator.dupe(u8, @errorName(err)) };
-    };
-    defer allocator.free(commit_raw);
-    const commit = try allocator.dupe(u8, std.mem.trim(u8, commit_raw, " \t\r\n"));
+    var commit: ?[]u8 = null;
+    if (try resolveRepoDir(allocator, root, package_name)) |repo_dir| {
+        defer allocator.free(repo_dir);
+        const commit_raw = shell.runCommandOutput(allocator, &.{ "git", "-C", repo_dir, "rev-parse", "HEAD" }) catch null;
+        if (commit_raw) |raw| {
+            defer allocator.free(raw);
+            commit = try allocator.dupe(u8, std.mem.trim(u8, raw, " \t\r\n"));
+        }
+    }
 
     validatePseudoGitFetchability(allocator, root, package_name) catch |err| {
         return .{
@@ -757,19 +754,6 @@ fn validatePseudoGitFetchability(
         .Exited => |code| if (code != 0) return error.ZigFetchFailed,
         else => return error.ZigFetchFailed,
     }
-}
-
-fn appendJsonStringLocal(allocator: std.mem.Allocator, body: *std.ArrayList(u8), value: []const u8) !void {
-    try body.append(allocator, '"');
-    for (value) |ch| switch (ch) {
-        '"' => try body.appendSlice(allocator, "\\\""),
-        '\\' => try body.appendSlice(allocator, "\\\\"),
-        '\n' => try body.appendSlice(allocator, "\\n"),
-        '\r' => try body.appendSlice(allocator, "\\r"),
-        '\t' => try body.appendSlice(allocator, "\\t"),
-        else => try body.append(allocator, ch),
-    };
-    try body.append(allocator, '"');
 }
 
 fn writeTextFileAbsolute(path: []const u8, content: []const u8) !void {

@@ -111,7 +111,7 @@ pub fn listPackagesJson(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     return try body.toOwnedSlice(allocator);
 }
 
-pub fn checkPackageJson(allocator: std.mem.Allocator, root: []const u8, package_name: []const u8) !?[]u8 {
+pub fn collectPackageInfos(allocator: std.mem.Allocator, root: []const u8) !std.ArrayList(types.PackageInfo) {
     var local_names = try collectLocalPackageNames(allocator, root);
     defer {
         for (local_names.items) |name| allocator.free(name);
@@ -124,58 +124,115 @@ pub fn checkPackageJson(allocator: std.mem.Allocator, root: []const u8, package_
         registered_names.deinit(allocator);
     }
 
-    const local = containsName(local_names.items, package_name);
-    const registered = containsName(registered_names.items, package_name);
-    const available = local or registered;
-    if (!available) return null;
+    std.mem.sort([]u8, local_names.items, {}, sortStringAsc);
+    std.mem.sort([]u8, registered_names.items, {}, sortStringAsc);
 
-    const tarball_dir = try std.fs.path.join(allocator, &.{ root, "p", package_name, "tag" });
-    defer allocator.free(tarball_dir);
-    const tarball_dir_present = accessExists(tarball_dir);
+    var merged = std.ArrayList([]u8).empty;
+    defer merged.deinit(allocator);
+    try appendMergedNames(allocator, &merged, local_names.items, registered_names.items);
 
-    var tarballs = try collectTarballTags(allocator, tarball_dir);
-    defer {
-        for (tarballs.items) |tag| allocator.free(tag);
-        tarballs.deinit(allocator);
+    var infos = std.ArrayList(types.PackageInfo).empty;
+    errdefer freePackageInfoList(allocator, &infos);
+
+    for (merged.items) |package_name| {
+        const local = containsName(local_names.items, package_name);
+        const registered = containsName(registered_names.items, package_name);
+        const tarball_dir = try std.fs.path.join(allocator, &.{ root, "p", package_name, "tag" });
+        defer allocator.free(tarball_dir);
+        const tarball_dir_present = accessExists(tarball_dir);
+
+        var tarballs = try collectTarballInfos(allocator, tarball_dir);
+        defer {
+            for (tarballs.items) |tag_info| allocator.free(tag_info.tag);
+            tarballs.deinit(allocator);
+        }
+        std.mem.sort(types.PackageTagInfo, tarballs.items, {}, sortPackageTagInfoAsc);
+
+        var tarballs_copy = try allocator.alloc(types.PackageTagInfo, tarballs.items.len);
+        errdefer {
+            for (tarballs_copy[0..tarballs.items.len]) |tag_info| allocator.free(tag_info.tag);
+            allocator.free(tarballs_copy);
+        }
+
+        var total_size: u64 = 0;
+        for (tarballs.items, 0..) |tag_info, index| {
+            tarballs_copy[index] = .{
+                .tag = try allocator.dupe(u8, tag_info.tag),
+                .size_bytes = tag_info.size_bytes,
+            };
+            total_size += tag_info.size_bytes;
+        }
+
+        const latest = if (tarballs_copy.len == 0) null else tarballs_copy[tarballs_copy.len - 1];
+        try infos.append(allocator, .{
+            .package = try allocator.dupe(u8, package_name),
+            .available = true,
+            .registered = registered,
+            .local = local,
+            .tarball_dir_present = tarball_dir_present,
+            .tarball_count = tarballs_copy.len,
+            .latest_tag = if (latest) |tag_info| tag_info.tag else null,
+            .latest_size_bytes = if (latest) |tag_info| tag_info.size_bytes else 0,
+            .size_bytes = total_size,
+            .tarballs = tarballs_copy,
+            .smart_http_ready = tarballs_copy.len != 0,
+        });
     }
-    std.mem.sort([]u8, tarballs.items, {}, sortStringAsc);
 
-    const latest_tag = if (tarballs.items.len == 0) null else tarballs.items[tarballs.items.len - 1];
-    const smart_http_ready = tarballs.items.len != 0;
-    const healthy = local and tarballs.items.len != 0;
+    std.mem.sort(types.PackageInfo, infos.items, {}, sortPackageInfoAsc);
+    return infos;
+}
+
+pub fn freePackageInfoList(allocator: std.mem.Allocator, infos: *std.ArrayList(types.PackageInfo)) void {
+    for (infos.items) |info| {
+        allocator.free(info.package);
+        for (info.tarballs) |tag_info| allocator.free(tag_info.tag);
+        allocator.free(info.tarballs);
+        if (info.fetch_probe_commit) |commit| allocator.free(commit);
+        if (info.fetch_probe_error) |probe_error| allocator.free(probe_error);
+    }
+    infos.deinit(allocator);
+}
+
+pub fn writePackageInfoSnapshot(allocator: std.mem.Allocator, root: []const u8, infos: []const types.PackageInfo) !void {
+    const state_dir = try ensureStateDir(allocator, root);
+    defer allocator.free(state_dir);
+    const snapshot_path = try std.fs.path.join(allocator, &.{ state_dir, "package-info.json" });
+    defer allocator.free(snapshot_path);
 
     var body = std.ArrayList(u8).empty;
     defer body.deinit(allocator);
 
-    try body.appendSlice(allocator, "{\"package\":");
-    try appendJsonString(allocator, &body, package_name);
-    try body.appendSlice(allocator, ",\"available\":");
-    try body.appendSlice(allocator, if (available) "true" else "false");
-    try body.appendSlice(allocator, ",\"registered\":");
-    try body.appendSlice(allocator, if (registered) "true" else "false");
-    try body.appendSlice(allocator, ",\"local\":");
-    try body.appendSlice(allocator, if (local) "true" else "false");
-    try body.appendSlice(allocator, ",\"tarball_dir_present\":");
-    try body.appendSlice(allocator, if (tarball_dir_present) "true" else "false");
-    try body.writer(allocator).print(",\"tarball_count\":{d}", .{tarballs.items.len});
-    try body.appendSlice(allocator, ",\"latest_tag\":");
-    if (latest_tag) |tag| {
-        try appendJsonString(allocator, &body, tag);
-    } else {
-        try body.appendSlice(allocator, "null");
-    }
-    try body.appendSlice(allocator, ",\"tarballs\":[");
-    for (tarballs.items, 0..) |tag, index| {
+    try body.appendSlice(allocator, "{\"packages\":[");
+    for (infos, 0..) |info, index| {
         if (index != 0) try body.append(allocator, ',');
-        try appendJsonString(allocator, &body, tag);
+        try appendPackageInfoJson(allocator, &body, info);
     }
-    try body.appendSlice(allocator, "],\"smart_http_ready\":");
-    try body.appendSlice(allocator, if (smart_http_ready) "true" else "false");
-    try body.appendSlice(allocator, ",\"healthy\":");
-    try body.appendSlice(allocator, if (healthy) "true" else "false");
-    try body.appendSlice(allocator, "}\n");
+    try body.appendSlice(allocator, "]}\n");
+    try writeTextFile(snapshot_path, body.items);
+}
 
-    return try body.toOwnedSlice(allocator);
+pub fn readPackageInfoJson(allocator: std.mem.Allocator, root: []const u8, package_name: []const u8) !?[]u8 {
+    const state_dir = try ensureStateDir(allocator, root);
+    defer allocator.free(state_dir);
+    const snapshot_path = try std.fs.path.join(allocator, &.{ state_dir, "package-info.json" });
+    defer allocator.free(snapshot_path);
+
+    const raw = try readOptionalFileAlloc(allocator, snapshot_path, 32 * 1024 * 1024) orelse return error.FileNotFound;
+    defer allocator.free(raw);
+
+    const parsed = try std.json.parseFromSlice(types.PackageInfoSnapshot, allocator, raw, .{});
+    defer parsed.deinit();
+
+    for (parsed.value.packages) |info| {
+        if (!std.mem.eql(u8, info.package, package_name)) continue;
+        var body = std.ArrayList(u8).empty;
+        defer body.deinit(allocator);
+        try appendPackageInfoJson(allocator, &body, info);
+        try body.append(allocator, '\n');
+        return try body.toOwnedSlice(allocator);
+    }
+    return null;
 }
 
 pub fn syncPackages(allocator: std.mem.Allocator, root: []const u8) !types.SyncStats {
@@ -763,6 +820,32 @@ fn collectTarballTags(allocator: std.mem.Allocator, tarball_dir: []const u8) !st
     return tags;
 }
 
+fn collectTarballInfos(allocator: std.mem.Allocator, tarball_dir: []const u8) !std.ArrayList(types.PackageTagInfo) {
+    var tags = std.ArrayList(types.PackageTagInfo).empty;
+    errdefer {
+        for (tags.items) |tag_info| allocator.free(tag_info.tag);
+        tags.deinit(allocator);
+    }
+
+    var dir = std.fs.cwd().openDir(tarball_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return tags,
+        else => return err,
+    };
+    defer dir.close();
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".tar.gz")) continue;
+        const stat = try dir.statFile(entry.name);
+        try tags.append(allocator, .{
+            .tag = try allocator.dupe(u8, entry.name[0 .. entry.name.len - ".tar.gz".len]),
+            .size_bytes = @intCast(stat.size),
+        });
+    }
+    return tags;
+}
+
 fn containsName(names: []const []u8, needle: []const u8) bool {
     for (names) |name| {
         if (std.mem.eql(u8, name, needle)) return true;
@@ -837,6 +920,14 @@ fn sortStringAsc(_: void, a: []u8, b: []u8) bool {
     return std.mem.lessThan(u8, a, b);
 }
 
+fn sortPackageTagInfoAsc(_: void, a: types.PackageTagInfo, b: types.PackageTagInfo) bool {
+    return std.mem.lessThan(u8, a.tag, b.tag);
+}
+
+fn sortPackageInfoAsc(_: void, a: types.PackageInfo, b: types.PackageInfo) bool {
+    return std.mem.lessThan(u8, a.package, b.package);
+}
+
 fn appendJsonString(allocator: std.mem.Allocator, body: *std.ArrayList(u8), value: []const u8) !void {
     try body.append(allocator, '"');
     for (value) |ch| switch (ch) {
@@ -848,6 +939,54 @@ fn appendJsonString(allocator: std.mem.Allocator, body: *std.ArrayList(u8), valu
         else => try body.append(allocator, ch),
     };
     try body.append(allocator, '"');
+}
+
+fn appendPackageInfoJson(allocator: std.mem.Allocator, body: *std.ArrayList(u8), info: types.PackageInfo) !void {
+    try body.appendSlice(allocator, "{\"package\":");
+    try appendJsonString(allocator, body, info.package);
+    try body.appendSlice(allocator, ",\"available\":");
+    try body.appendSlice(allocator, if (info.available) "true" else "false");
+    try body.appendSlice(allocator, ",\"registered\":");
+    try body.appendSlice(allocator, if (info.registered) "true" else "false");
+    try body.appendSlice(allocator, ",\"local\":");
+    try body.appendSlice(allocator, if (info.local) "true" else "false");
+    try body.appendSlice(allocator, ",\"tarball_dir_present\":");
+    try body.appendSlice(allocator, if (info.tarball_dir_present) "true" else "false");
+    try body.writer(allocator).print(",\"tarball_count\":{d}", .{info.tarball_count});
+    try body.appendSlice(allocator, ",\"latest_tag\":");
+    if (info.latest_tag) |tag| {
+        try appendJsonString(allocator, body, tag);
+    } else {
+        try body.appendSlice(allocator, "null");
+    }
+    try body.writer(allocator).print(",\"latest_size_bytes\":{d}", .{info.latest_size_bytes});
+    try body.writer(allocator).print(",\"size_bytes\":{d}", .{info.size_bytes});
+    try body.appendSlice(allocator, ",\"tarballs\":[");
+    for (info.tarballs, 0..) |tag_info, index| {
+        if (index != 0) try body.append(allocator, ',');
+        try body.appendSlice(allocator, "{\"tag\":");
+        try appendJsonString(allocator, body, tag_info.tag);
+        try body.writer(allocator).print(",\"size_bytes\":{d}}}", .{tag_info.size_bytes});
+    }
+    try body.appendSlice(allocator, "],\"smart_http_ready\":");
+    try body.appendSlice(allocator, if (info.smart_http_ready) "true" else "false");
+    try body.appendSlice(allocator, ",\"pseudo_git_fetchable\":");
+    try body.appendSlice(allocator, if (info.pseudo_git_fetchable) "true" else "false");
+    try body.appendSlice(allocator, ",\"fetch_probe_commit\":");
+    if (info.fetch_probe_commit) |commit| {
+        try appendJsonString(allocator, body, commit);
+    } else {
+        try body.appendSlice(allocator, "null");
+    }
+    try body.appendSlice(allocator, ",\"fetch_probe_error\":");
+    if (info.fetch_probe_error) |probe_error| {
+        try appendJsonString(allocator, body, probe_error);
+    } else {
+        try body.appendSlice(allocator, "null");
+    }
+    try body.appendSlice(allocator, ",\"healthy\":");
+    try body.appendSlice(allocator, if (info.healthy) "true" else "false");
+    try body.writer(allocator).print(",\"updated_at\":{d}}}", .{info.updated_at});
 }
 
 const SourceRepoAction = enum {

@@ -15,7 +15,7 @@ BATCH_FETCH_DIR=""
 INFO_URL="${SCHEME}://${DOMAIN}/api/info"
 LIST_URL="${SCHEME}://${DOMAIN}/api/list"
 UPDATE_URL="${SCHEME}://${DOMAIN}/api/update"
-CHECK_URL_BASE="${SCHEME}://${DOMAIN}/api/check"
+PACKAGE_INFO_URL_BASE="${SCHEME}://${DOMAIN}/api/info"
 
 if [ -z "$DOMAIN" ]; then
     printf 'usage: %s <domain> [repo] [expected-release]\n' "${BASH_SOURCE[0]}" >&2
@@ -89,11 +89,28 @@ fi
 
 printf 'remote package list contains %s\n' "$REPO_NAME"
 
-CHECK_RESP="$(curl -fsS "${CHECK_URL_BASE}/${REPO_NAME}")"
-printf '%s' "$CHECK_RESP" | grep -q '"healthy":true'
-printf '%s' "$CHECK_RESP" | grep -Eq '"tarball_count":[1-9][0-9]*'
+UPDATE_RESP="$(curl -fsS -X POST "$UPDATE_URL")"
+printf 'api/update response: %s\n' "$UPDATE_RESP"
 
-printf 'remote package check for %s: OK\n' "$REPO_NAME"
+for _ in $(seq 1 90); do
+    UPDATE_STATE="$(curl -fsS "$INFO_URL" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
+    if [ "$UPDATE_STATE" = "idle" ]; then
+        break
+    fi
+    sleep 1
+done
+
+if [ "${UPDATE_STATE:-}" != "idle" ]; then
+    printf 'api/update did not reach idle state\n' >&2
+    exit 1
+fi
+
+PKG_INFO_RESP="$(curl -fsS "${PACKAGE_INFO_URL_BASE}/${REPO_NAME}")"
+printf '%s' "$PKG_INFO_RESP" | grep -q '"healthy":true'
+printf '%s' "$PKG_INFO_RESP" | grep -Eq '"tarball_count":[1-9][0-9]*'
+printf '%s' "$PKG_INFO_RESP" | grep -Eq '"size_bytes":[1-9][0-9]*'
+
+printf 'remote package info for %s: OK\n' "$REPO_NAME"
 
 if ! curl -fsS "${REMOTE_URL}/info/refs" >/dev/null; then
     printf 'remote repository endpoint not available: %s/info/refs\n' "$REMOTE_URL" >&2
@@ -190,27 +207,51 @@ BATCH_FETCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/packbase-remote-batch-fetch-XXXXXX
 
 INSTALLED_COUNT=0
 SELECTED_PACKAGES=""
-while IFS= read -r pkg; do
-    [ -n "$pkg" ] || continue
-    PKG_CHECK_RESP="$(curl -fsS "${CHECK_URL_BASE}/${pkg}")"
-    if ! printf '%s' "$PKG_CHECK_RESP" | grep -q '"healthy":true'; then
+PACKAGE_RANKING="$(
+LIST_CANDIDATES="$LIST_CANDIDATES" PACKAGE_INFO_URL_BASE="$PACKAGE_INFO_URL_BASE" python3 - <<'PY'
+import json
+import os
+import sys
+import urllib.request
+
+base = os.environ["PACKAGE_INFO_URL_BASE"]
+candidates = [line.strip() for line in os.environ["LIST_CANDIDATES"].splitlines() if line.strip()]
+ranked = []
+for name in candidates:
+    try:
+        with urllib.request.urlopen(f"{base}/{name}") as response:
+            info = json.load(response)
+    except Exception:
         continue
-    fi
-    if ! printf '%s' "$PKG_CHECK_RESP" | grep -Eq '"tarball_count":[1-9][0-9]*'; then
+    if not info.get("healthy"):
         continue
-    fi
+    if info.get("tarball_count", 0) <= 0:
+        continue
+    size = int(info.get("size_bytes") or 0)
+    if size <= 0:
+        continue
+    ranked.append((size, name))
+
+ranked.sort()
+for size, name in ranked[:10]:
+    print(f"{size}\t{name}")
+PY
+)"
+
+while IFS=$'\t' read -r size_bytes pkg; do
+    [ -n "${pkg:-}" ] || continue
     (cd "$BATCH_FETCH_DIR" && zig fetch --save "git+${SCHEME}://${DOMAIN}/${pkg}" --global-cache-dir .zig-cache)
     INSTALLED_COUNT=$((INSTALLED_COUNT + 1))
     if [ -z "$SELECTED_PACKAGES" ]; then
-        SELECTED_PACKAGES="$pkg"
+        SELECTED_PACKAGES="${pkg} (${size_bytes} B)"
     else
-        SELECTED_PACKAGES="$SELECTED_PACKAGES, $pkg"
+        SELECTED_PACKAGES="$SELECTED_PACKAGES, ${pkg} (${size_bytes} B)"
     fi
     if [ "$INSTALLED_COUNT" -eq 10 ]; then
         break
     fi
 done <<EOF
-$LIST_CANDIDATES
+$PACKAGE_RANKING
 EOF
 
 if [ "$INSTALLED_COUNT" -ne 10 ]; then
