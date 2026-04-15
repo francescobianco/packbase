@@ -14,22 +14,22 @@ All persistent data lives under `PACKBASE_ROOT` (default: `/data` in the Docker 
 ├── p/                          # tarballs — the primary truth
 │   └── {package}/
 │       └── tag/
-│           ├── v1.0.0.tar.gz
-│           ├── v1.0.0.manifest.json
-│           ├── v1.2.3.tar.gz
-│           └── v1.2.3.manifest.json
+│           ├── v1.0.0.tar.gz         # immutable tarball for tag v1.0.0
+│           ├── v1.0.0.manifest.json  # metadata: commit, hashes, size
+│           ├── v1.2.3.tar.gz         # immutable tarball for tag v1.2.3
+│           └── v1.2.3.manifest.json # metadata: commit, hashes, size
 └── .packbase/                  # all internal state (never served directly)
-    ├── update.lock
-    ├── update.pending
-    ├── update.last
-    ├── update.status.json
-    ├── source.json
-    ├── source.previous.json
-    ├── source.diff.json
-    ├── registered.json
-    ├── package-info.json
-    └── pkg-ts/
-        └── {source-record-id}
+    ├── update.lock             # Unix timestamp; prevents concurrent update runs
+    ├── update.pending          # Unix timestamp; signals queued update request
+    ├── update.last             # Unix timestamp; enforces 15s cooldown between calls
+    ├── update.status.json      # current update state: idle|running|queued|cooldown
+    ├── source.json             # raw catalog from PACKBASE_SOURCE (last download)
+    ├── source.previous.json    # previous source.json (kept only on catalog change)
+    ├── source.diff.json        # summary of changes: added/updated/removed/skip
+    ├── registered.json         # flat list of package names from catalog
+    ├── package-info.json       # full snapshot: all packages, health, probes
+    └── pkg-ts/                 # per-catalog-entry timestamp cache
+        └── {source-record-id}  # cached updated_at string; skips probe if unchanged
 ```
 
 ---
@@ -220,6 +220,39 @@ One file per source-catalog package, named after the package's `id` field in the
 4. The file is rewritten with the current `updated_at` regardless.
 
 This makes repeated `POST /api/update` calls significantly cheaper when the upstream catalog hasn't changed.
+
+---
+
+## File reference map
+
+This table maps each file in `.packbase/` to the functions in `src/sync.zig` that read or write it.
+
+| File | Read by | Written by | Notes |
+|---|---|---|---|
+| `update.lock` | `beginUpdateWindow()` | `beginUpdateWindow()` | Created before spawning worker; deleted by `finishUpdateWindow()`. Blocks concurrent updates for 5 min. |
+| `update.pending` | `finishUpdateWindow()` | `beginUpdateWindow()` | Signals that a new update was requested while one was running. |
+| `update.last` | `beginUpdateWindow()` | `beginUpdateWindow()` | Enforces 15s cooldown between `/api/update` calls. |
+| `update.status.json` | `readUpdateStatusJson()`, `GET /api/status` | `writeUpdateStatus()`, `writeUpdateProgress()` | JSON snapshot of worker state; served verbatim via `/api/status`. |
+| `source.json` | `syncSourceCatalog()` | `syncSourceCatalog()` | Raw download of `PACKBASE_SOURCE`. Compared byte-by-byte with previous to detect changes. |
+| `source.previous.json` | `syncSourceCatalog()` (diff) | `syncSourceCatalog()` | Kept only when catalog changed. Used to compute diff. |
+| `source.diff.json` | `syncSourceCatalog()` | `writeSourceDiffSnapshot()` | Summary of catalog changes (added/updated/removed/skipped counts). |
+| `registered.json` | `collectRegisteredPackageNames()`, `/api/list` | `writeRegisteredSnapshot()` | Flat JSON array of package names extracted from catalog. |
+| `package-info.json` | `loadSnapshotProbeData()`, `collectPackageInfos()`, `GET /api/info` | `writePackageInfoSnapshot()` | Full package state snapshot with health probes. Rebuilt at end of every update. |
+| `pkg-ts/{id}` | `syncSourceCatalog()` | `syncSourceCatalog()` | Cached `updated_at` per catalog entry. Written unconditionally; probe skipped if content unchanged. |
+
+### Atomic writes
+
+All state files are written using a **temp + rename** pattern to avoid torn writes:
+
+```
+writeXxxFile(path, content)
+  ├── create tmp_path = "{dir}/.{basename}.{timestamp}.tmp"
+  ├── write content to tmp file
+  ├── fsync (optional)
+  └── rename(tmp_path, path)  ← atomic on POSIX
+```
+
+This prevents readers from ever seeing a truncated or partially-written JSON file during an update. The flag `ENABLE_ATOMIC_WRITES` in `src/sync.zig` controls this behavior (currently `true`). Set to `false` for a minor write-speed improvement at the cost of potential read corruption during writes.
 
 ---
 
