@@ -9,9 +9,9 @@ EXPECTED_RELEASE="${3:-${PACKBASE_EXPECTED_RELEASE:-}}"
 SCHEME="${PACKBASE_REMOTE_SCHEME:-https}"
 REMOTE_URL="${SCHEME}://${DOMAIN}/${REPO_NAME}"
 TARGET_DIR="$TMP_DIR/remote-clone"
-FETCH_DIR=""
-FETCH_REPEAT_DIR=""
-BATCH_FETCH_DIR=""
+FETCH_DIR="$TMP_DIR/remote-fetch"
+FETCH_REPEAT_DIR="$TMP_DIR/remote-fetch-repeat"
+BATCH_FETCH_DIR="$TMP_DIR/remote-batch-fetch"
 INFO_URL="${SCHEME}://${DOMAIN}/api/status"
 LIST_URL="${SCHEME}://${DOMAIN}/api/list"
 UPDATE_URL="${SCHEME}://${DOMAIN}/api/update"
@@ -25,15 +25,6 @@ fi
 
 cleanup() {
     rm -rf "$TARGET_DIR"
-    if [ -n "$FETCH_DIR" ]; then
-        printf 'remote fetch workspace: %s\n' "$FETCH_DIR"
-    fi
-    if [ -n "$FETCH_REPEAT_DIR" ]; then
-        printf 'remote repeat workspace: %s\n' "$FETCH_REPEAT_DIR"
-    fi
-    if [ -n "$BATCH_FETCH_DIR" ]; then
-        printf 'remote batch workspace: %s\n' "$BATCH_FETCH_DIR"
-    fi
 }
 
 trap cleanup EXIT
@@ -125,9 +116,7 @@ grep -q 'hello_fixture' "$TARGET_DIR/build.zig.zon"
 
 printf 'remote git clone without /git prefix: OK\n'
 
-FETCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/packbase-remote-fetch-XXXXXX")"
-FETCH_REPEAT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/packbase-remote-fetch-repeat-XXXXXX")"
-
+rm -rf "$FETCH_DIR" "$FETCH_REPEAT_DIR"
 mkdir -p "$FETCH_DIR" "$FETCH_REPEAT_DIR"
 
 (cd "$FETCH_DIR" && zig init >/dev/null)
@@ -202,7 +191,8 @@ for name in names:
 PY
 )"
 
-BATCH_FETCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/packbase-remote-batch-fetch-XXXXXX")"
+rm -rf "$BATCH_FETCH_DIR"
+mkdir -p "$BATCH_FETCH_DIR"
 (cd "$BATCH_FETCH_DIR" && zig init >/dev/null)
 
 INSTALLED_COUNT=0
