@@ -976,7 +976,7 @@ fn ensureFetchedRemoteTagTarballProto(
 
     const tarball_path = try tarballPathFor(allocator, root, package_name, tag.name);
     defer allocator.free(tarball_path);
-    const commit = try std.fmt.allocPrint(allocator, "{x}", .{tag.target.slice()});
+    const commit = try formatHexAlloc(allocator, tag.target.slice());
     defer allocator.free(commit);
     if (pathExists(tarball_path) and try manifestMatchesCommit(allocator, root, package_name, tag.name, commit)) {
         stats.tarballs_present += 1;
@@ -994,7 +994,7 @@ fn ensureFetchedRemoteTagTarballProto(
 
     const response_buffer = try allocator.alloc(u8, 64 * 1024);
     defer allocator.free(response_buffer);
-    const want = try std.fmt.allocPrint(allocator, "{x}", .{tag.target.slice()});
+    const want = try formatHexAlloc(allocator, tag.target.slice());
     defer allocator.free(want);
 
     var fetch_stream: git_proto.Session.FetchStream = undefined;
@@ -1115,6 +1115,17 @@ const TarballDigests = struct {
     crc32: []u8,
 };
 
+fn formatHexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, index| {
+        const hi: u4 = @intCast(byte >> 4);
+        const lo: u4 = @intCast(byte & 0x0f);
+        out[index * 2] = "0123456789abcdef"[hi];
+        out[index * 2 + 1] = "0123456789abcdef"[lo];
+    }
+    return out;
+}
+
 fn computeTarballDigests(allocator: std.mem.Allocator, tarball_path: []const u8) !TarballDigests {
     var file = try std.fs.cwd().openFile(tarball_path, .{});
     defer file.close();
@@ -1137,8 +1148,8 @@ fn computeTarballDigests(allocator: std.mem.Allocator, tarball_path: []const u8)
     var md5_bytes: [16]u8 = undefined;
     md5.final(&md5_bytes);
     return .{
-        .sha256 = try std.fmt.allocPrint(allocator, "{x}", .{sha256_bytes}),
-        .md5 = try std.fmt.allocPrint(allocator, "{x}", .{md5_bytes}),
+        .sha256 = try formatHexAlloc(allocator, &sha256_bytes),
+        .md5 = try formatHexAlloc(allocator, &md5_bytes),
         .crc32 = try std.fmt.allocPrint(allocator, "{x:0>8}", .{crc32.final()}),
     };
 }
