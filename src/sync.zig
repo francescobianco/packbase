@@ -6,7 +6,7 @@ const release_id_raw = @embedFile("RELEASE_ID");
 
 const ENABLE_ATOMIC_WRITES = true;
 
-fn formatBytesHumanReadable(bytes: u64) [16]u8 {
+fn formatBytesHumanReadable(bytes: u64, allocator: std.mem.Allocator) ![]u8 {
     const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB" };
     var value: f64 = @floatFromInt(bytes);
     var unit_index: usize = 0;
@@ -14,13 +14,11 @@ fn formatBytesHumanReadable(bytes: u64) [16]u8 {
         value /= 1024;
         unit_index += 1;
     }
-    var buf: [16]u8 = undefined;
     if (unit_index == 0) {
-        _ = std.fmt.bufPrint(&buf, "{d} {s}", .{ @as(u64, @intFromFloat(value)), units[unit_index] }) catch unreachable;
+        return std.fmt.allocPrint(allocator, "{d} {s}", .{ @as(u64, @intFromFloat(value)), units[unit_index] });
     } else {
-        _ = std.fmt.bufPrint(&buf, "{d:.1} {s}", .{ value, units[unit_index] }) catch unreachable;
+        return std.fmt.allocPrint(allocator, "{d:.1} {s}", .{ value, units[unit_index] });
     }
-    return buf;
 }
 
 fn getDiskFreeSpace(allocator: std.mem.Allocator, root: []const u8) u64 {
@@ -778,8 +776,8 @@ fn writeUpdateStatus(
     const status_path = try std.fs.path.join(allocator, &.{ state_dir, "update.status.json" });
     defer allocator.free(status_path);
 
-    const disk_free_hr = formatBytesHumanReadable(stats.disk_free);
-    const disk_free_str = std.mem.trim(u8, &disk_free_hr, " ");
+    const disk_free_str = try formatBytesHumanReadable(stats.disk_free, allocator);
+    defer allocator.free(disk_free_str);
 
     const base_body = try std.fmt.allocPrint(
         allocator,
