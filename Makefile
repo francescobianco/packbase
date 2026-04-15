@@ -5,7 +5,7 @@ PREBUILT_BIN := dist/packbase-linux-x86_64
 prepare-prebuilt:
 	@echo "Building local prebuilt binary..."
 	@mkdir -p dist
-	@zig build -Doptimize=ReleaseSafe
+	@zig build -Doptimize=ReleaseSafe -Dcpu=baseline
 	@cp zig-out/bin/packbase "$(PREBUILT_BIN)"
 	@chmod +x "$(PREBUILT_BIN)"
 	@echo "Prebuilt ready: $(PREBUILT_BIN)"
