@@ -11,6 +11,31 @@ const UpdateWorkerArgs = struct {
     source_url: []u8,
 };
 
+const PackageCheckBasic = struct {
+    package: []const u8,
+    available: bool,
+    registered: bool,
+    local: bool,
+    tarball_dir_present: bool,
+    tarball_count: usize,
+    latest_tag: ?[]const u8 = null,
+    tarballs: []const []const u8 = &.{},
+    smart_http_ready: bool,
+    healthy: bool,
+};
+
+const FetchProbeResult = struct {
+    pseudo_git_fetchable: bool,
+    commit: ?[]u8 = null,
+    probe_error: ?[]u8 = null,
+
+    fn deinit(self: *FetchProbeResult, allocator: std.mem.Allocator) void {
+        if (self.commit) |commit| allocator.free(commit);
+        if (self.probe_error) |probe_error| allocator.free(probe_error);
+        self.* = undefined;
+    }
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -549,7 +574,7 @@ fn handleCheckPackage(
         return;
     }
 
-    const body = (try sync.checkPackageJson(allocator, root, package_name)) orelse {
+    const basic_body = (try sync.checkPackageJson(allocator, root, package_name)) orelse {
         const not_found = try std.fmt.allocPrint(
             allocator,
             "{{\"status\":\"not_found\",\"package\":\"{s}\"}}\n",
@@ -560,10 +585,197 @@ fn handleCheckPackage(
         if (!head_only) try connection.stream.writeAll(not_found);
         return;
     };
-    defer allocator.free(body);
+    defer allocator.free(basic_body);
 
-    try http.writeHeaders(connection, "200 OK", "application/json", body.len);
-    if (!head_only) try connection.stream.writeAll(body);
+    const parsed = try std.json.parseFromSlice(PackageCheckBasic, allocator, basic_body, .{});
+    defer parsed.deinit();
+
+    var probe = try probePseudoGitFetchability(allocator, root, parsed.value.package, parsed.value.local);
+    defer probe.deinit(allocator);
+
+    const healthy = parsed.value.local and parsed.value.tarball_count != 0 and probe.pseudo_git_fetchable;
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+
+    try body.appendSlice(allocator, "{\"package\":");
+    try appendJsonStringLocal(allocator, &body, parsed.value.package);
+    try body.appendSlice(allocator, ",\"available\":");
+    try body.appendSlice(allocator, if (parsed.value.available) "true" else "false");
+    try body.appendSlice(allocator, ",\"registered\":");
+    try body.appendSlice(allocator, if (parsed.value.registered) "true" else "false");
+    try body.appendSlice(allocator, ",\"local\":");
+    try body.appendSlice(allocator, if (parsed.value.local) "true" else "false");
+    try body.appendSlice(allocator, ",\"tarball_dir_present\":");
+    try body.appendSlice(allocator, if (parsed.value.tarball_dir_present) "true" else "false");
+    try body.writer(allocator).print(",\"tarball_count\":{d}", .{parsed.value.tarball_count});
+    try body.appendSlice(allocator, ",\"latest_tag\":");
+    if (parsed.value.latest_tag) |tag| {
+        try appendJsonStringLocal(allocator, &body, tag);
+    } else {
+        try body.appendSlice(allocator, "null");
+    }
+    try body.appendSlice(allocator, ",\"tarballs\":[");
+    for (parsed.value.tarballs, 0..) |tag, index| {
+        if (index != 0) try body.append(allocator, ',');
+        try appendJsonStringLocal(allocator, &body, tag);
+    }
+    try body.appendSlice(allocator, "],\"smart_http_ready\":");
+    try body.appendSlice(allocator, if (parsed.value.smart_http_ready) "true" else "false");
+    try body.appendSlice(allocator, ",\"pseudo_git_fetchable\":");
+    try body.appendSlice(allocator, if (probe.pseudo_git_fetchable) "true" else "false");
+    try body.appendSlice(allocator, ",\"fetch_probe_commit\":");
+    if (probe.commit) |commit| {
+        try appendJsonStringLocal(allocator, &body, commit);
+    } else {
+        try body.appendSlice(allocator, "null");
+    }
+    try body.appendSlice(allocator, ",\"fetch_probe_error\":");
+    if (probe.probe_error) |probe_error| {
+        try appendJsonStringLocal(allocator, &body, probe_error);
+    } else {
+        try body.appendSlice(allocator, "null");
+    }
+    try body.appendSlice(allocator, ",\"healthy\":");
+    try body.appendSlice(allocator, if (healthy) "true" else "false");
+    try body.appendSlice(allocator, "}\n");
+
+    try http.writeHeaders(connection, "200 OK", "application/json", body.items.len);
+    if (!head_only) try connection.stream.writeAll(body.items);
+}
+
+fn probePseudoGitFetchability(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    package_name: []const u8,
+    local: bool,
+) !FetchProbeResult {
+    if (!local) return .{ .pseudo_git_fetchable = false, .probe_error = try allocator.dupe(u8, "package_not_local") };
+
+    const repo_dir = (try resolveRepoDir(allocator, root, package_name)) orelse {
+        return .{ .pseudo_git_fetchable = false, .probe_error = try allocator.dupe(u8, "repo_unavailable") };
+    };
+    defer allocator.free(repo_dir);
+
+    const commit_raw = shell.runCommandOutput(allocator, &.{ "git", "-C", repo_dir, "rev-parse", "HEAD" }) catch |err| {
+        return .{ .pseudo_git_fetchable = false, .probe_error = try allocator.dupe(u8, @errorName(err)) };
+    };
+    defer allocator.free(commit_raw);
+    const commit = try allocator.dupe(u8, std.mem.trim(u8, commit_raw, " \t\r\n"));
+
+    validatePseudoGitFetchability(allocator, root, package_name) catch |err| {
+        return .{
+            .pseudo_git_fetchable = false,
+            .commit = commit,
+            .probe_error = try allocator.dupe(u8, @errorName(err)),
+        };
+    };
+
+    return .{
+        .pseudo_git_fetchable = true,
+        .commit = commit,
+    };
+}
+
+fn validatePseudoGitFetchability(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    package_name: []const u8,
+) !void {
+    const helper_port: u16 = 19082;
+    const helper_port_text = try std.fmt.allocPrint(allocator, "{d}", .{helper_port});
+    defer allocator.free(helper_port_text);
+
+    var env_map = try std.process.getEnvMap(allocator);
+    defer env_map.deinit();
+    try env_map.put("PACKBASE_ROOT", root);
+    try env_map.put("PACKBASE_PORT", helper_port_text);
+    env_map.remove("PACKBASE_TOKEN");
+
+    var helper = std.process.Child.init(&.{ "/usr/local/bin/packbase" }, allocator);
+    helper.stdin_behavior = .Close;
+    helper.stdout_behavior = .Ignore;
+    helper.stderr_behavior = .Ignore;
+    helper.env_map = &env_map;
+    try helper.spawn();
+    defer {
+        _ = helper.kill() catch {};
+        _ = helper.wait() catch {};
+    }
+
+    const info_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api/info", .{helper_port});
+    defer allocator.free(info_url);
+    var ready = false;
+    var attempts: usize = 0;
+    while (attempts < 50) : (attempts += 1) {
+        const info = shell.runCommandOutput(allocator, &.{ "curl", "-fsS", info_url }) catch {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+            continue;
+        };
+        allocator.free(info);
+        ready = true;
+        break;
+    }
+    if (!ready) return error.HelperServerUnavailable;
+
+    const probe_dir = try std.fmt.allocPrint(allocator, "/tmp/packbase-fetch-probe-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(probe_dir);
+    defer std.fs.deleteTreeAbsolute(probe_dir) catch {};
+    try std.fs.makeDirAbsolute(probe_dir);
+
+    const build_zig = try std.fs.path.join(allocator, &.{ probe_dir, "build.zig" });
+    defer allocator.free(build_zig);
+    const build_zon = try std.fs.path.join(allocator, &.{ probe_dir, "build.zig.zon" });
+    defer allocator.free(build_zon);
+
+    try writeTextFileAbsolute(build_zig,
+        \\const std = @import("std");
+        \\
+        \\pub fn build(_: *std.Build) void {}
+        \\
+    );
+    try writeTextFileAbsolute(build_zon,
+        \\ .{
+        \\     .name = .packbase_probe,
+        \\     .version = "0.0.0",
+        \\     .dependencies = .{},
+        \\     .paths = .{""},
+        \\ }
+        \\
+    );
+
+    const fetch_url = try std.fmt.allocPrint(allocator, "git+http://127.0.0.1:{d}/{s}", .{ helper_port, package_name });
+    defer allocator.free(fetch_url);
+
+    var fetch = std.process.Child.init(&.{ "zig", "fetch", "--save", fetch_url, "--global-cache-dir", ".zig-cache" }, allocator);
+    fetch.stdin_behavior = .Close;
+    fetch.stdout_behavior = .Ignore;
+    fetch.stderr_behavior = .Ignore;
+    fetch.cwd = probe_dir;
+    const term = try fetch.spawnAndWait();
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.ZigFetchFailed,
+        else => return error.ZigFetchFailed,
+    }
+}
+
+fn appendJsonStringLocal(allocator: std.mem.Allocator, body: *std.ArrayList(u8), value: []const u8) !void {
+    try body.append(allocator, '"');
+    for (value) |ch| switch (ch) {
+        '"' => try body.appendSlice(allocator, "\\\""),
+        '\\' => try body.appendSlice(allocator, "\\\\"),
+        '\n' => try body.appendSlice(allocator, "\\n"),
+        '\r' => try body.appendSlice(allocator, "\\r"),
+        '\t' => try body.appendSlice(allocator, "\\t"),
+        else => try body.append(allocator, ch),
+    };
+    try body.append(allocator, '"');
+}
+
+fn writeTextFileAbsolute(path: []const u8, content: []const u8) !void {
+    var file = try std.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll(content);
 }
 
 fn authorizeRequest(

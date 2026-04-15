@@ -18,13 +18,21 @@ RUN cp zig-out/bin/packbase /out/packbase
 
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates curl git
+ARG ZIG_VERSION=0.15.1
+
+RUN apk add --no-cache ca-certificates curl git xz
+
+RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+    -o /tmp/zig.tar.xz \
+    && mkdir -p /opt/zig \
+    && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
 
 COPY --from=build /out/packbase /usr/local/bin/packbase
 RUN mkdir -p /var/lib/packbase/public
 
 ENV PACKBASE_ROOT=/var/lib/packbase/public
 ENV PACKBASE_PORT=8080
+ENV PATH=/opt/zig:$PATH
 
 EXPOSE 8080
 

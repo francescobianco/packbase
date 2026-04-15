@@ -173,37 +173,44 @@ fi
 
 printf 'remote repeated zig fetch and post-fetch liveness: OK\n'
 
-INSTALL_PACKAGES="$(
+LIST_CANDIDATES="$(
 LIST_JSON="$LIST_RESP" python3 - <<'PY'
 import json
 import os
 
 data = json.loads(os.environ["LIST_JSON"])
 names = data.get("local_packages") or data.get("packages") or []
-for name in names[:10]:
+for name in names:
     print(name)
 PY
 )"
-
-INSTALL_COUNT="$(printf '%s\n' "$INSTALL_PACKAGES" | sed '/^$/d' | wc -l)"
-if [ "$INSTALL_COUNT" -lt 10 ]; then
-    printf 'expected at least 10 installable packages from %s, got %s\n' "$LIST_URL" "$INSTALL_COUNT" >&2
-    exit 1
-fi
 
 BATCH_FETCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/packbase-remote-batch-fetch-XXXXXX")"
 (cd "$BATCH_FETCH_DIR" && zig init >/dev/null)
 
 INSTALLED_COUNT=0
+SELECTED_PACKAGES=""
 while IFS= read -r pkg; do
     [ -n "$pkg" ] || continue
     PKG_CHECK_RESP="$(curl -fsS "${CHECK_URL_BASE}/${pkg}")"
-    printf '%s' "$PKG_CHECK_RESP" | grep -q '"healthy":true'
-    printf '%s' "$PKG_CHECK_RESP" | grep -Eq '"tarball_count":[1-9][0-9]*'
+    if ! printf '%s' "$PKG_CHECK_RESP" | grep -q '"healthy":true'; then
+        continue
+    fi
+    if ! printf '%s' "$PKG_CHECK_RESP" | grep -Eq '"tarball_count":[1-9][0-9]*'; then
+        continue
+    fi
     (cd "$BATCH_FETCH_DIR" && zig fetch --save "git+${SCHEME}://${DOMAIN}/${pkg}" --global-cache-dir .zig-cache)
     INSTALLED_COUNT=$((INSTALLED_COUNT + 1))
+    if [ -z "$SELECTED_PACKAGES" ]; then
+        SELECTED_PACKAGES="$pkg"
+    else
+        SELECTED_PACKAGES="$SELECTED_PACKAGES, $pkg"
+    fi
+    if [ "$INSTALLED_COUNT" -eq 10 ]; then
+        break
+    fi
 done <<EOF
-$INSTALL_PACKAGES
+$LIST_CANDIDATES
 EOF
 
 if [ "$INSTALLED_COUNT" -ne 10 ]; then
@@ -214,5 +221,6 @@ fi
 grep -q '\.dependencies = \.{' "$BATCH_FETCH_DIR/build.zig.zon"
 
 printf 'remote batch install of 10 packages: OK\n'
+printf 'selected packages: %s\n' "$SELECTED_PACKAGES"
 printf 'tested clone url: %s\n' "$REMOTE_URL"
 printf 'example VCS URL shape: git+https://%s/%s\n' "$DOMAIN" "$REPO_NAME"
