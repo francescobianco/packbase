@@ -194,12 +194,12 @@ UPDATE_RESP="$(curl -fsS -X POST "http://127.0.0.1:${HOST_PORT}/api/update")"
 printf 'api/update response: %s\n' "$UPDATE_RESP"
 printf '%s' "$UPDATE_RESP" | grep -q '"status":"started"'
 
-RUNNING_INFO_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/info")"
-printf 'api/info during update: %s\n' "$RUNNING_INFO_RESP"
+RUNNING_INFO_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/status")"
+printf 'api/status during update: %s\n' "$RUNNING_INFO_RESP"
 printf '%s' "$RUNNING_INFO_RESP" | grep -q '"state":"running"\|"state":"idle"'
 
 for _ in $(seq 1 120); do
-    UPDATE_INFO_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/info")"
+    UPDATE_INFO_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/status")"
     printf '%s' "$UPDATE_INFO_RESP" | grep -q '"service":"packbase"'
     if printf '%s' "$UPDATE_INFO_RESP" | grep -q '"state":"idle"'; then
         break
@@ -207,9 +207,11 @@ for _ in $(seq 1 120); do
     sleep 1
 done
 
-printf 'api/info after update: %s\n' "$UPDATE_INFO_RESP"
+printf 'api/status after update: %s\n' "$UPDATE_INFO_RESP"
 printf '%s' "$UPDATE_INFO_RESP" | grep -q '"state":"idle"'
-printf '%s' "$UPDATE_INFO_RESP" | grep -q '"source_repo_cloned":1'
+printf '%s' "$UPDATE_INFO_RESP" | grep -q '"packages_total":'
+printf '%s' "$UPDATE_INFO_RESP" | grep -q '"packages_healthy":'
+printf '%s' "$UPDATE_INFO_RESP" | grep -q '"packages_unhealthy":'
 
 REPAIRED_LIST_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/list")"
 printf 'repaired api/list response: %s\n' "$REPAIRED_LIST_RESP"
@@ -217,29 +219,25 @@ printf '%s' "$REPAIRED_LIST_RESP" | grep -q '"hello"'
 printf '%s' "$REPAIRED_LIST_RESP" | grep -q '"remote-only"'
 printf '%s' "$REPAIRED_LIST_RESP" | grep -q '"registered_packages":'
 printf '%s' "$REPAIRED_LIST_RESP" | grep -q '"local_packages":'
-if printf '%s' "$REPAIRED_LIST_RESP" | grep -q '"local_packages":\[[^]]*"remote-only"'; then
-    printf 'remote-only should not be materialized until its tarball is requested\n' >&2
+if ! printf '%s' "$REPAIRED_LIST_RESP" | grep -q '"local_packages":\[[^]]*"remote-only"'; then
+    printf 'remote-only should be materialized during /api/update\n' >&2
     exit 1
 fi
 
 curl -fsS "http://127.0.0.1:${HOST_PORT}/p/remote-only/tag/v0.1.0.tar.gz" >/dev/null
 
-ONDEMAND_LIST_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/list")"
-printf 'on-demand api/list response: %s\n' "$ONDEMAND_LIST_RESP"
-printf '%s' "$ONDEMAND_LIST_RESP" | grep -q '"local_packages":\[[^]]*"remote-only"'
-
 printf 'api/update: OK\n'
 
 # ── Phase 6d: verify the release identifier exposed by this build ────────────
-RELEASE_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/info")"
+RELEASE_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/status")"
 
-printf 'api/info response: %s\n' "$RELEASE_RESP"
+printf 'api/status response: %s\n' "$RELEASE_RESP"
 
 printf '%s' "$RELEASE_RESP" | grep -q "\"release\":\"${EXPECTED_RELEASE}\""
 printf '%s' "$RELEASE_RESP" | grep -q '"service":"packbase"'
-printf '%s' "$RELEASE_RESP" | grep -q '"source_repo_cloned":1'
+printf '%s' "$RELEASE_RESP" | grep -q '"packages_total":'
 
-printf 'api/info: OK\n'
+printf 'api/status: OK\n'
 
 # ── Phase 6e: verify persisted package info metadata ──────────────────────────
 CHECK_RESP="$(curl -fsS "http://127.0.0.1:${HOST_PORT}/api/info/hello")"

@@ -111,7 +111,10 @@ Mirror an upstream Git repository.
   "status": "ok",
   "package": "repo",
   "tag": "v1.2.3",
-  "url": "/p/repo/tag/v1.2.3.tar.gz"
+  "url": "/p/repo/tag/v1.2.3.tar.gz",
+  "tarballs_created": 4,
+  "tarballs_present": 0,
+  "tarball_count": 4
 }
 ```
 
@@ -123,7 +126,7 @@ Mirror an upstream Git repository.
 | `401` | Missing Authorization header |
 | `403` | Invalid token |
 | `422` | Repository has no tags |
-| `502` | `git clone` failed (network or URL error) |
+| `502` | upstream fetch failed (network or URL error) |
 
 ### `GET /p/<package>/tag/<tag>.tar.gz`
 
@@ -184,7 +187,7 @@ Le informazioni non vengono calcolate on demand: se manca lo snapshot, va esegui
 }
 ```
 
-### `GET /api/info`
+### `GET /api/status`
 
 Restituisce metadati dell'istanza, incluso l'identificativo di rilascio della
 build servita e lo stato persistito dell'ultima `update`.
@@ -194,6 +197,9 @@ build servita e lo stato persistito dell'ultima `update`.
 {
   "service": "packbase",
   "release": "r0007",
+  "packages_total": 79,
+  "packages_healthy": 74,
+  "packages_unhealthy": 5,
   "update": {
     "state": "idle",
     "started_at": 1776183143,
@@ -206,8 +212,8 @@ build servita e lo stato persistito dell'ultima `update`.
 ### `POST /api/update`
 
 Riallinea in modo soft lo stato interno in modo pubblico e idempotente:
-- usa i repository ospitati sotto `/git` come sorgente di verità locale
-- rigenera i tarball mancanti sotto `/p`
+- materializza i tarball mancanti sotto `/p` per i pacchetti del source catalog che non sono `fresh`
+- mantiene il supporto ai repository fixture locali
 - aggiorna `update-server-info`
 - scarica `PACKBASE_SOURCE`, conserva lo snapshot locale, calcola un diff con lo snapshot precedente e aggiorna la lista dei pacchetti registrati
 - aggiorna lo snapshot persistito dei package sotto `.packbase/package-info.json`, includendo size e fetchability pseudo-Git

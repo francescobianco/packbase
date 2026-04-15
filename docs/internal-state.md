@@ -16,11 +16,6 @@ All persistent data lives under `PACKBASE_ROOT` (default: `/data` in the Docker 
 │       └── tag/
 │           ├── v1.0.0.tar.gz
 │           └── v1.2.3.tar.gz
-├── git/                        # bare repos (populated by /api/fetch, deleted after update)
-│   └── {package}.git/
-├── public/                     # static files served as-is (e.g. git/ for fixture repos)
-│   └── git/
-│       └── {repo}.git/
 └── .packbase/                  # all internal state (never served directly)
     ├── update.lock
     ├── update.pending
@@ -42,28 +37,15 @@ All persistent data lives under `PACKBASE_ROOT` (default: `/data` in the Docker 
 **Path:** `{root}/p/{package_name}/tag/{tag}.tar.gz`
 
 Tarballs are the primary truth of the registry. They are:
-- Created via `git archive --format=tar.gz {tag}` from a cloned bare repo.
+- Created from the upstream tag snapshot and written atomically under `p/`.
 - Deterministic: the same tag always produces the same bytes.
 - Immutable once written: never overwritten.
 
-There are two creation paths:
-1. **`POST /api/fetch`** — clones the upstream repo, runs the archive for each tag, writes tarballs immediately.
-2. **On-demand** — when a `GET /p/{package}/tag/{tag}.tar.gz` request arrives and the tarball is not present on disk, Packbase tries to materialize it if the package is in the source catalog (uses a temporary clone in `/tmp`).
+There are two materialization paths:
+1. **`POST /api/fetch`** — atomic sync of a single package, materializing all remote tags immediately.
+2. **`POST /api/update`** — walks the source catalog and materializes packages selectively, skipping entries whose upstream `updated_at` is unchanged.
 
-Packbase never stores the cloned repo as a persistent artifact — only the tarball survives.
-
----
-
-## Bare repos (`git/`)
-
-**Path:** `{root}/git/{package_name}.git/`
-
-Bare repos are transient. They are:
-- Created during `POST /api/fetch` (or on-demand materialization).
-- Used only to run `git archive` and extract tags.
-- Removed after each `POST /api/update` cycle (`docker compose exec packbase rm -rf /data/git`).
-
-They do not serve as a source of truth. If they are absent, tarballs are generated on demand from temporary clones.
+For HTTP(S) remotes, Packbase uses the low-level Git protocol client implemented in `src/git.zig` to list refs and fetch packfiles. Local fallback transport is still used only for non-HTTP sources such as `file://` fixtures.
 
 ---
 
@@ -110,6 +92,11 @@ Written at every state transition of the background worker. Reflects the current
 Possible values of `state`: `idle`, `running`, `queued`, `cooldown`.
 
 `source_skipped` counts packages whose `updated_at` from the source catalog was unchanged since the last sync — see the per-package timestamp cache section below.
+
+`GET /api/status` wraps this object and adds top-level package statistics:
+- `packages_total`
+- `packages_healthy`
+- `packages_unhealthy`
 
 ### `source.json`
 

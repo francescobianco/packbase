@@ -11,6 +11,13 @@ const UpdateWorkerArgs = struct {
     source_url: []u8,
 };
 
+const FetchResponse = struct {
+    package_name: []const u8,
+    latest_tag: []const u8,
+    tarballs_created: usize,
+    tarballs_present: usize,
+};
+
 const FetchProbeResult = struct {
     pseudo_git_fetchable: bool,
     commit: ?[]u8 = null,
@@ -216,10 +223,7 @@ fn handleConnection(
     defer allocator.free(resolved);
 
     var file = std.fs.cwd().openFile(resolved, .{}) catch |err| switch (err) {
-        error.FileNotFound => retry: {
-            if (try maybeMaterializeRequestedTarball(allocator, root, routed_path)) {
-                break :retry try std.fs.cwd().openFile(resolved, .{});
-            }
+        error.FileNotFound => {
             try http.sendSimpleResponse(connection, "404 Not Found", "text/plain", "not found\n");
             return;
         },
@@ -265,63 +269,35 @@ fn handleFetch(
     defer parsed.deinit();
     const url = parsed.value.url;
 
-    const http_url = if (std.mem.startsWith(u8, url, "git+")) url[4..] else url;
-    const slash_pos = std.mem.lastIndexOfScalar(u8, http_url, '/') orelse 0;
-    const raw_name = http_url[slash_pos + 1 ..];
-    const pkg_name = if (std.mem.endsWith(u8, raw_name, ".git")) raw_name[0 .. raw_name.len - 4] else raw_name;
-
-    const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/packbase-{d}", .{std.time.nanoTimestamp()});
-    defer allocator.free(tmp_path);
-    defer std.fs.deleteTreeAbsolute(tmp_path) catch {};
-
-    shell.runCommand(allocator, &[_][]const u8{ "git", "clone", "--quiet", http_url, tmp_path }) catch {
-        try http.sendSimpleResponse(connection, "502 Bad Gateway", "text/plain", "git clone failed\n");
-        return;
+    const fetch_result = performFetch(allocator, root, url) catch |err| switch (err) {
+        error.NoTagsFound => {
+            try http.sendSimpleResponse(connection, "422 Unprocessable Entity", "text/plain", "no tags found\n");
+            return;
+        },
+        error.CommandFailed => {
+            try http.sendSimpleResponse(connection, "502 Bad Gateway", "text/plain", "git fetch failed\n");
+            return;
+        },
+        else => return err,
     };
 
-    const tag_raw = shell.runCommandOutput(allocator, &[_][]const u8{
-        "git", "-C", tmp_path, "describe", "--tags", "--abbrev=0",
-    }) catch {
-        try http.sendSimpleResponse(connection, "422 Unprocessable Entity", "text/plain", "no tags found\n");
-        return;
-    };
-    defer allocator.free(tag_raw);
-    const tag = std.mem.trim(u8, tag_raw, " \t\r\n");
-
-    const pkg_dir = try std.fmt.allocPrint(allocator, "{s}/p/{s}/tag", .{ root, pkg_name });
-    defer allocator.free(pkg_dir);
-    try shell.runCommand(allocator, &[_][]const u8{ "mkdir", "-p", pkg_dir });
-
-    const tarball_path = try std.fmt.allocPrint(allocator, "{s}/{s}.tar.gz", .{ pkg_dir, tag });
-    defer allocator.free(tarball_path);
-
-    shell.runCommand(allocator, &[_][]const u8{ "git", "-C", tmp_path, "checkout", "--quiet", tag }) catch {
-        try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "checkout failed\n");
-        return;
+    refreshPackageInfoSnapshot(allocator, root, null, null) catch |err| {
+        std.log.warn("package info refresh after fetch failed: {s}", .{@errorName(err)});
     };
 
-    const stage_path = try std.fmt.allocPrint(allocator, "{s}_stage", .{tmp_path});
-    defer allocator.free(stage_path);
-    defer std.fs.deleteTreeAbsolute(stage_path) catch {};
-
-    try shell.runCommand(allocator, &[_][]const u8{ "cp", "-r", tmp_path, stage_path });
-    const stage_git = try std.fs.path.join(allocator, &.{ stage_path, ".git" });
-    defer allocator.free(stage_git);
-    std.fs.deleteTreeAbsolute(stage_git) catch {};
-
-    const stage_parent = std.fs.path.dirname(stage_path) orelse "/tmp";
-    const stage_base = std.fs.path.basename(stage_path);
-    shell.runCommand(allocator, &[_][]const u8{ "tar", "czf", tarball_path, "-C", stage_parent, stage_base }) catch {
-        try http.sendSimpleResponse(connection, "500 Internal Server Error", "text/plain", "archive failed\n");
-        return;
-    };
-
-    const pkg_url = try std.fmt.allocPrint(allocator, "/p/{s}/tag/{s}.tar.gz", .{ pkg_name, tag });
+    const pkg_url = try std.fmt.allocPrint(allocator, "/p/{s}/tag/{s}.tar.gz", .{ fetch_result.package_name, fetch_result.latest_tag });
     defer allocator.free(pkg_url);
     const resp_body = try std.fmt.allocPrint(
         allocator,
-        "{{\"status\":\"ok\",\"package\":\"{s}\",\"tag\":\"{s}\",\"url\":\"{s}\"}}\n",
-        .{ pkg_name, tag, pkg_url },
+        "{{\"status\":\"ok\",\"package\":\"{s}\",\"tag\":\"{s}\",\"url\":\"{s}\",\"tarballs_created\":{d},\"tarballs_present\":{d},\"tarball_count\":{d}}}\n",
+        .{
+            fetch_result.package_name,
+            fetch_result.latest_tag,
+            pkg_url,
+            fetch_result.tarballs_created,
+            fetch_result.tarballs_present,
+            fetch_result.tarballs_created + fetch_result.tarballs_present,
+        },
     );
     defer allocator.free(resp_body);
 
@@ -383,90 +359,6 @@ fn handleUpdate(
     try connection.stream.writeAll(body);
 }
 
-fn maybeMaterializeRequestedTarball(
-    allocator: std.mem.Allocator,
-    root: []const u8,
-    request_path: []const u8,
-) !bool {
-    if (!std.mem.startsWith(u8, request_path, "/p/")) return false;
-    if (!std.mem.endsWith(u8, request_path, ".tar.gz")) return false;
-
-    var parts = std.mem.splitScalar(u8, request_path[1..], '/');
-    const prefix = parts.next() orelse return false;
-    const package_name = parts.next() orelse return false;
-    const kind = parts.next() orelse return false;
-    const tarball_name = parts.next() orelse return false;
-    if (parts.next() != null) return false;
-    if (!std.mem.eql(u8, prefix, "p")) return false;
-    if (!std.mem.eql(u8, kind, "tag")) return false;
-    if (!std.mem.endsWith(u8, tarball_name, ".tar.gz")) return false;
-
-    const tag = tarball_name[0 .. tarball_name.len - ".tar.gz".len];
-    var source_record = (try sync.lookupSourceRecordByPackage(allocator, root, package_name)) orelse return false;
-    defer sync.freeSourceRecord(allocator, &source_record);
-    if (source_record.repo_url.len == 0) return false;
-
-    try materializeTarballOnDemand(allocator, root, package_name, tag, source_record.repo_url);
-    return true;
-}
-
-fn materializeTarballOnDemand(
-    allocator: std.mem.Allocator,
-    root: []const u8,
-    package_name: []const u8,
-    tag: []const u8,
-    repo_url: []const u8,
-) !void {
-    const pkg_dir = try std.fs.path.join(allocator, &.{ root, "p", package_name, "tag" });
-    defer allocator.free(pkg_dir);
-    try shell.runCommand(allocator, &.{ "mkdir", "-p", pkg_dir });
-
-    const tarball_name = try std.fmt.allocPrint(allocator, "{s}.tar.gz", .{tag});
-    defer allocator.free(tarball_name);
-    const tarball_path = try std.fs.path.join(allocator, &.{ pkg_dir, tarball_name });
-    defer allocator.free(tarball_path);
-
-    if (std.fs.cwd().access(tarball_path, .{})) |_| {
-        return;
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    }
-
-    const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/packbase-ondemand-{d}", .{std.time.nanoTimestamp()});
-    defer allocator.free(tmp_path);
-    defer std.fs.deleteTreeAbsolute(tmp_path) catch {};
-
-    try shell.runCommand(allocator, &.{ "git", "init", "--quiet", tmp_path });
-    try shell.runCommand(allocator, &.{ "git", "-C", tmp_path, "remote", "add", "origin", repo_url });
-
-    const tag_ref = try std.fmt.allocPrint(allocator, "refs/tags/{s}:refs/tags/{s}", .{ tag, tag });
-    defer allocator.free(tag_ref);
-    try shell.runCommand(allocator, &.{
-        "git", "-c", "protocol.file.allow=always", "-c", "safe.directory=*",
-        "-C", tmp_path, "fetch", "--depth", "1", "--quiet", "origin", tag_ref,
-    });
-
-    const checkout_target = try std.fmt.allocPrint(allocator, "tags/{s}", .{tag});
-    defer allocator.free(checkout_target);
-    try shell.runCommand(allocator, &.{ "git", "-C", tmp_path, "checkout", "--quiet", checkout_target });
-
-    const stage_path = try std.fmt.allocPrint(allocator, "{s}_stage", .{tmp_path});
-    defer allocator.free(stage_path);
-    defer std.fs.deleteTreeAbsolute(stage_path) catch {};
-
-    try shell.runCommand(allocator, &.{ "cp", "-r", tmp_path, stage_path });
-    const stage_git = try std.fs.path.join(allocator, &.{ stage_path, ".git" });
-    defer allocator.free(stage_git);
-    std.fs.deleteTreeAbsolute(stage_git) catch {};
-
-    const stage_parent = std.fs.path.dirname(stage_path) orelse "/tmp";
-    const stage_base = std.fs.path.basename(stage_path);
-    try shell.runCommand(allocator, &.{ "tar", "czf", tarball_path, "-C", stage_parent, stage_base });
-
-    std.log.info("tarball materialized on demand package={s} tag={s}", .{ package_name, tag });
-}
-
 fn updateWorker(args: *UpdateWorkerArgs) void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -508,90 +400,19 @@ fn updateWorker(args: *UpdateWorkerArgs) void {
         std.log.warn("sync failed: {s}", .{@errorName(err)});
         return;
     };
-    stats.repos_scanned = local_stats.repos_scanned;
-    stats.packages_synced = local_stats.packages_synced;
-    stats.tarballs_created = local_stats.tarballs_created;
-    stats.tarballs_present = local_stats.tarballs_present;
-    stats.default_seeded = local_stats.default_seeded;
+    stats.repos_scanned += local_stats.repos_scanned;
+    stats.packages_synced += local_stats.packages_synced;
+    stats.tarballs_created += local_stats.tarballs_created;
+    stats.tarballs_present += local_stats.tarballs_present;
+    stats.default_seeded = stats.default_seeded or local_stats.default_seeded;
 
-    var package_infos = sync.collectPackageInfos(allocator, root) catch |err| {
-        std.log.warn("package info collection failed: {s}", .{@errorName(err)});
-        return;
-    };
-    defer sync.freePackageInfoList(allocator, &package_infos);
-
-    // Build set of fresh package names (unchanged updated_at from source)
     var fresh_packages = std.StringHashMap(void).init(allocator);
     defer fresh_packages.deinit();
     for (source_records.items) |record| {
         if (record.fresh) fresh_packages.put(record.package_name, {}) catch {};
     }
 
-    // Load previous probe snapshot (used to reuse results for fresh packages)
-    var prev_probes = sync.loadSnapshotProbeData(allocator, root) catch std.StringHashMap(sync.SnapshotProbeData).init(allocator);
-    defer sync.freeSnapshotProbeData(allocator, &prev_probes);
-
-    stats.packages_total = package_infos.items.len;
-    stats.packages_probed = 0;
-    sync.writeUpdateProgress(allocator, root, &stats) catch |err| {
-        std.log.warn("progress write failed: {s}", .{@errorName(err)});
-    };
-
-    const updated_at = std.time.timestamp();
-    for (package_infos.items) |*info| {
-        info.updated_at = updated_at;
-        info.smart_http_ready = info.tarball_count != 0;
-
-        // Skip probe when upstream updated_at is unchanged: reuse previous result.
-        if (fresh_packages.contains(info.package)) {
-            if (prev_probes.get(info.package)) |prev| {
-                info.pseudo_git_fetchable = prev.pseudo_git_fetchable;
-                info.fetch_probe_commit = if (prev.fetch_probe_commit) |c|
-                    allocator.dupe(u8, c) catch null
-                else
-                    null;
-                info.fetch_probe_error = if (prev.fetch_probe_error) |e|
-                    allocator.dupe(u8, e) catch null
-                else
-                    null;
-                info.healthy = prev.healthy;
-            }
-            stats.packages_probed += 1;
-            sync.writeUpdateProgress(allocator, root, &stats) catch {};
-            continue;
-        }
-
-        var probe = probePseudoGitFetchability(allocator, root, info.package, info.local) catch |err| {
-            std.log.warn("fetch probe failed package={s} error={s}", .{ info.package, @errorName(err) });
-            stats.packages_probed += 1;
-            sync.writeUpdateProgress(allocator, root, &stats) catch {};
-            continue;
-        };
-        defer probe.deinit(allocator);
-
-        info.pseudo_git_fetchable = probe.pseudo_git_fetchable;
-        if (probe.commit) |commit| {
-            info.fetch_probe_commit = allocator.dupe(u8, commit) catch |err| {
-                std.log.warn("commit copy failed package={s} error={s}", .{ info.package, @errorName(err) });
-                stats.packages_probed += 1;
-                sync.writeUpdateProgress(allocator, root, &stats) catch {};
-                continue;
-            };
-        }
-        if (probe.probe_error) |probe_error| {
-            info.fetch_probe_error = allocator.dupe(u8, probe_error) catch |err| {
-                std.log.warn("probe error copy failed package={s} error={s}", .{ info.package, @errorName(err) });
-                stats.packages_probed += 1;
-                sync.writeUpdateProgress(allocator, root, &stats) catch {};
-                continue;
-            };
-        }
-        info.healthy = info.local and info.tarball_count != 0 and info.pseudo_git_fetchable;
-        stats.packages_probed += 1;
-        sync.writeUpdateProgress(allocator, root, &stats) catch {};
-    }
-
-    sync.writePackageInfoSnapshot(allocator, root, package_infos.items) catch |err| {
+    refreshPackageInfoSnapshot(allocator, root, &fresh_packages, &stats) catch |err| {
         std.log.warn("package info snapshot write failed: {s}", .{@errorName(err)});
         return;
     };
@@ -607,7 +428,7 @@ fn updateWorker(args: *UpdateWorkerArgs) void {
             stats.source_repo_cloned,
             stats.source_repo_updated,
             stats.source_repo_failed,
-            package_infos.items.len,
+            stats.packages_total,
         },
     );
 }
@@ -660,10 +481,11 @@ fn handleStatus(
     const release_id = std.mem.trimRight(u8, release_id_raw, "\r\n");
     const update_status = try sync.readUpdateStatusJson(allocator, root);
     defer allocator.free(update_status);
+    const package_health = try sync.readPackageHealthSummary(allocator, root);
     const body = try std.fmt.allocPrint(
         allocator,
-        "{{\"service\":\"packbase\",\"release\":\"{s}\",\"update\":{s}}}\n",
-        .{ release_id, update_status },
+        "{{\"service\":\"packbase\",\"release\":\"{s}\",\"packages_total\":{d},\"packages_healthy\":{d},\"packages_unhealthy\":{d},\"update\":{s}}}\n",
+        .{ release_id, package_health.total, package_health.healthy, package_health.unhealthy, update_status },
     );
     defer allocator.free(body);
 
@@ -751,6 +573,121 @@ fn probePseudoGitFetchability(
         .pseudo_git_fetchable = true,
         .commit = commit,
     };
+}
+
+fn performFetch(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    url: []const u8,
+) !FetchResponse {
+    const http_url = if (std.mem.startsWith(u8, url, "git+")) url[4..] else url;
+    const slash_pos = std.mem.lastIndexOfScalar(u8, http_url, '/') orelse return error.InvalidFetchUrl;
+    const raw_name = http_url[slash_pos + 1 ..];
+    const pkg_name = if (std.mem.endsWith(u8, raw_name, ".git")) raw_name[0 .. raw_name.len - 4] else raw_name;
+    if (pkg_name.len == 0) return error.InvalidFetchUrl;
+
+    const record: types.SourceRecord = .{
+        .id = try allocator.dupe(u8, pkg_name),
+        .repo_url = try allocator.dupe(u8, http_url),
+        .package_name = try allocator.dupe(u8, pkg_name),
+        .default_ref = try allocator.dupe(u8, ""),
+        .updated_at = try allocator.dupe(u8, ""),
+        .fresh = false,
+    };
+    defer sync.freeSourceRecord(allocator, @constCast(&record));
+
+    var stats = types.SyncStats{};
+    var result = try sync.syncSingleSourceRecord(allocator, root, record, &stats);
+    defer result.deinit(allocator);
+
+    return .{
+        .package_name = try allocator.dupe(u8, result.package_name),
+        .latest_tag = try allocator.dupe(u8, result.latest_tag),
+        .tarballs_created = result.tarballs_created,
+        .tarballs_present = result.tarballs_present,
+    };
+}
+
+fn refreshPackageInfoSnapshot(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    fresh_packages: ?*const std.StringHashMap(void),
+    stats: ?*types.SyncStats,
+) !void {
+    var package_infos = try sync.collectPackageInfos(allocator, root);
+    defer sync.freePackageInfoList(allocator, &package_infos);
+
+    var prev_probes = sync.loadSnapshotProbeData(allocator, root) catch std.StringHashMap(sync.SnapshotProbeData).init(allocator);
+    defer sync.freeSnapshotProbeData(allocator, &prev_probes);
+
+    if (stats) |s| {
+        s.packages_total = package_infos.items.len;
+        s.packages_probed = 0;
+        sync.writeUpdateProgress(allocator, root, s) catch |err| {
+            std.log.warn("progress write failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    const updated_at = std.time.timestamp();
+    for (package_infos.items) |*info| {
+        info.updated_at = updated_at;
+        info.smart_http_ready = info.tarball_count != 0;
+
+        if (fresh_packages) |fresh| {
+            if (fresh.contains(info.package)) {
+                if (prev_probes.get(info.package)) |prev| {
+                    info.pseudo_git_fetchable = prev.pseudo_git_fetchable;
+                    info.fetch_probe_commit = if (prev.fetch_probe_commit) |c| allocator.dupe(u8, c) catch null else null;
+                    info.fetch_probe_error = if (prev.fetch_probe_error) |e| allocator.dupe(u8, e) catch null else null;
+                    info.healthy = prev.healthy;
+                }
+                if (stats) |s| {
+                    s.packages_probed += 1;
+                    sync.writeUpdateProgress(allocator, root, s) catch {};
+                }
+                continue;
+            }
+        }
+
+        var probe = probePseudoGitFetchability(allocator, root, info.package, info.local) catch |err| {
+            std.log.warn("fetch probe failed package={s} error={s}", .{ info.package, @errorName(err) });
+            if (stats) |s| {
+                s.packages_probed += 1;
+                sync.writeUpdateProgress(allocator, root, s) catch {};
+            }
+            continue;
+        };
+        defer probe.deinit(allocator);
+
+        info.pseudo_git_fetchable = probe.pseudo_git_fetchable;
+        if (probe.commit) |commit| {
+            info.fetch_probe_commit = allocator.dupe(u8, commit) catch |err| {
+                std.log.warn("commit copy failed package={s} error={s}", .{ info.package, @errorName(err) });
+                if (stats) |s| {
+                    s.packages_probed += 1;
+                    sync.writeUpdateProgress(allocator, root, s) catch {};
+                }
+                continue;
+            };
+        }
+        if (probe.probe_error) |probe_error| {
+            info.fetch_probe_error = allocator.dupe(u8, probe_error) catch |err| {
+                std.log.warn("probe error copy failed package={s} error={s}", .{ info.package, @errorName(err) });
+                if (stats) |s| {
+                    s.packages_probed += 1;
+                    sync.writeUpdateProgress(allocator, root, s) catch {};
+                }
+                continue;
+            };
+        }
+        info.healthy = info.local and info.tarball_count != 0 and info.pseudo_git_fetchable;
+        if (stats) |s| {
+            s.packages_probed += 1;
+            sync.writeUpdateProgress(allocator, root, s) catch {};
+        }
+    }
+
+    try sync.writePackageInfoSnapshot(allocator, root, package_infos.items);
 }
 
 fn validatePseudoGitFetchability(

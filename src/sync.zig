@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const shell = @import("shell.zig");
+const git_proto = @import("git.zig");
 
 pub fn beginUpdateWindow(allocator: std.mem.Allocator, root: []const u8) !types.SyncStats {
     var stats = types.SyncStats{};
@@ -171,6 +172,30 @@ pub const SnapshotProbeData = struct {
     healthy: bool,
 };
 
+pub const PackageHealthSummary = struct {
+    total: usize = 0,
+    healthy: usize = 0,
+    unhealthy: usize = 0,
+};
+
+pub const SourcePackageSyncResult = struct {
+    package_name: []u8,
+    latest_tag: []u8,
+    tarballs_created: usize = 0,
+    tarballs_present: usize = 0,
+
+    pub fn deinit(self: *SourcePackageSyncResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.package_name);
+        allocator.free(self.latest_tag);
+        self.* = undefined;
+    }
+};
+
+const RemoteTag = struct {
+    name: []u8,
+    target: git_proto.Oid,
+};
+
 pub fn loadSnapshotProbeData(
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -214,6 +239,30 @@ pub fn freeSnapshotProbeData(allocator: std.mem.Allocator, map: *std.StringHashM
         if (entry.value_ptr.fetch_probe_error) |e| allocator.free(e);
     }
     map.deinit();
+}
+
+pub fn readPackageHealthSummary(allocator: std.mem.Allocator, root: []const u8) !PackageHealthSummary {
+    const state_dir = try ensureStateDir(allocator, root);
+    defer allocator.free(state_dir);
+    const snapshot_path = try std.fs.path.join(allocator, &.{ state_dir, "package-info.json" });
+    defer allocator.free(snapshot_path);
+
+    const raw = (try readOptionalFileAlloc(allocator, snapshot_path, 32 * 1024 * 1024)) orelse return .{};
+    defer allocator.free(raw);
+
+    const parsed = try std.json.parseFromSlice(types.PackageInfoSnapshot, allocator, raw, .{});
+    defer parsed.deinit();
+
+    var summary = PackageHealthSummary{};
+    for (parsed.value.packages) |info| {
+        summary.total += 1;
+        if (info.healthy) {
+            summary.healthy += 1;
+        } else {
+            summary.unhealthy += 1;
+        }
+    }
+    return summary;
 }
 
 pub fn collectPackageInfos(allocator: std.mem.Allocator, root: []const u8) !std.ArrayList(types.PackageInfo) {
@@ -435,16 +484,91 @@ pub fn syncSourceRepos(
     refresh_existing: bool,
     stats: *types.SyncStats,
 ) !void {
-    _ = allocator;
-    _ = root;
     _ = refresh_existing;
-    _ = stats;
-    if (records.len != 0) {
-        std.log.info(
-            "source repo materialization skipped for {d} records; tarballs are now created on demand",
-            .{records.len},
-        );
+    for (records) |record| {
+        if (record.fresh) continue;
+        var result = syncSingleSourceRecord(allocator, root, record, stats) catch |err| {
+            stats.source_repo_failed += 1;
+            std.log.warn("source package sync failed package={s} error={s}", .{ record.package_name, @errorName(err) });
+            continue;
+        };
+        result.deinit(allocator);
     }
+}
+
+pub fn syncSingleSourceRecord(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    record: types.SourceRecord,
+    stats: *types.SyncStats,
+) !SourcePackageSyncResult {
+    if (!isHttpGitUrl(record.repo_url)) {
+        return syncSingleSourceRecordShell(allocator, root, record, stats);
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
+
+    const response_buffer = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(response_buffer);
+
+    const uri = try std.Uri.parse(record.repo_url);
+    const session = try git_proto.Session.init(arena, &client, uri, response_buffer);
+
+    var tags = try listRemoteTagsProto(allocator, session, response_buffer);
+    defer freeRemoteTagList(allocator, &tags);
+    if (tags.items.len == 0) return error.NoTagsFound;
+
+    const before_created = stats.tarballs_created;
+    const before_present = stats.tarballs_present;
+    for (tags.items) |tag| {
+        try ensureFetchedRemoteTagTarballProto(allocator, root, record.package_name, tag, session, stats);
+    }
+
+    return .{
+        .package_name = try allocator.dupe(u8, record.package_name),
+        .latest_tag = try allocator.dupe(u8, tags.items[tags.items.len - 1].name),
+        .tarballs_created = stats.tarballs_created - before_created,
+        .tarballs_present = stats.tarballs_present - before_present,
+    };
+}
+
+fn syncSingleSourceRecordShell(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    record: types.SourceRecord,
+    stats: *types.SyncStats,
+) !SourcePackageSyncResult {
+    var tags = try listRemoteTagsShell(allocator, record.repo_url);
+    defer freeRemoteTagList(allocator, &tags);
+    if (tags.items.len == 0) return error.NoTagsFound;
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/packbase-source-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(tmp_path);
+    defer std.fs.deleteTreeAbsolute(tmp_path) catch {};
+
+    try shell.runCommand(allocator, &.{
+        "git", "-c", "protocol.file.allow=always", "-c", "safe.directory=*",
+        "init", "--quiet", tmp_path,
+    });
+    try shell.runCommand(allocator, &.{ "git", "-C", tmp_path, "remote", "add", "origin", record.repo_url });
+
+    const before_created = stats.tarballs_created;
+    const before_present = stats.tarballs_present;
+    for (tags.items) |tag| {
+        try ensureFetchedRemoteTagTarballShell(allocator, root, tmp_path, record.package_name, tag.name, stats);
+    }
+
+    return .{
+        .package_name = try allocator.dupe(u8, record.package_name),
+        .latest_tag = try allocator.dupe(u8, tags.items[tags.items.len - 1].name),
+        .tarballs_created = stats.tarballs_created - before_created,
+        .tarballs_present = stats.tarballs_present - before_present,
+    };
 }
 
 pub fn freeSourceRecordList(allocator: std.mem.Allocator, records: *std.ArrayList(types.SourceRecord)) void {
@@ -618,6 +742,44 @@ fn syncRepoPackage(
     if (saw_tag) stats.packages_synced += 1;
 }
 
+fn ensureFetchedRemoteTagTarballShell(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    repo_path: []const u8,
+    package_name: []const u8,
+    tag: []const u8,
+    stats: *types.SyncStats,
+) !void {
+    const pkg_dir = try std.fs.path.join(allocator, &.{ root, "p", package_name, "tag" });
+    defer allocator.free(pkg_dir);
+    try shell.runCommand(allocator, &[_][]const u8{ "mkdir", "-p", pkg_dir });
+
+    const tarball_name = try std.fmt.allocPrint(allocator, "{s}.tar.gz", .{tag});
+    defer allocator.free(tarball_name);
+    const tarball_path = try std.fs.path.join(allocator, &.{ pkg_dir, tarball_name });
+    defer allocator.free(tarball_path);
+
+    if (std.fs.cwd().access(tarball_path, .{})) |_| {
+        stats.tarballs_present += 1;
+        std.log.info("tarball present package={s} tag={s}", .{ package_name, tag });
+        return;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    const tag_ref = try std.fmt.allocPrint(allocator, "refs/tags/{s}:refs/tags/{s}", .{ tag, tag });
+    defer allocator.free(tag_ref);
+    try shell.runCommand(allocator, &.{
+        "git", "-c", "protocol.file.allow=always", "-c", "safe.directory=*",
+        "-C", repo_path, "fetch", "--depth", "1", "--quiet", "origin", tag_ref,
+    });
+
+    try archiveGitTag(allocator, repo_path, tag, tarball_path);
+    stats.tarballs_created += 1;
+    std.log.info("tarball created package={s} tag={s}", .{ package_name, tag });
+}
+
 fn ensureRepoTarball(
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -651,6 +813,161 @@ fn ensureRepoTarball(
     try archiveGitTag(allocator, repo_path, tag, tarball_path);
     stats.tarballs_created += 1;
     std.log.info("tarball created package={s} tag={s}", .{ package_name, tag });
+}
+
+fn listRemoteTagsShell(allocator: std.mem.Allocator, repo_url: []const u8) !std.ArrayList(RemoteTag) {
+    const tags_raw = try shell.runCommandOutput(allocator, &.{
+        "git", "-c", "protocol.file.allow=always", "-c", "safe.directory=*",
+        "ls-remote", "--tags", "--refs", repo_url,
+    });
+    defer allocator.free(tags_raw);
+
+    var tags = std.ArrayList(RemoteTag).empty;
+    errdefer {
+        freeRemoteTagList(allocator, &tags);
+        tags.deinit(allocator);
+    }
+
+    var lines = std.mem.splitScalar(u8, tags_raw, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, trimmed, '\t') orelse continue;
+        const ref_name = trimmed[tab + 1 ..];
+        if (!std.mem.startsWith(u8, ref_name, "refs/tags/")) continue;
+        try tags.append(allocator, .{
+            .name = try allocator.dupe(u8, ref_name["refs/tags/".len..]),
+            .target = git_proto.Oid.parseAny(trimmed[0..tab]) catch continue,
+        });
+    }
+
+    std.mem.sort(RemoteTag, tags.items, {}, sortRemoteTagAsc);
+    return tags;
+}
+
+fn listRemoteTagsProto(
+    allocator: std.mem.Allocator,
+    session: git_proto.Session,
+    response_buffer: []u8,
+) !std.ArrayList(RemoteTag) {
+    var it: git_proto.Session.RefIterator = undefined;
+    try session.listRefs(&it, .{
+        .ref_prefixes = &.{"refs/tags/"},
+        .include_peeled = true,
+        .buffer = response_buffer,
+    });
+    defer it.deinit();
+
+    var tags = std.ArrayList(RemoteTag).empty;
+    errdefer {
+        freeRemoteTagList(allocator, &tags);
+        tags.deinit(allocator);
+    }
+
+    while (try it.next()) |ref| {
+        if (!std.mem.startsWith(u8, ref.name, "refs/tags/")) continue;
+        try tags.append(allocator, .{
+            .name = try allocator.dupe(u8, ref.name["refs/tags/".len..]),
+            .target = ref.peeled orelse ref.oid,
+        });
+    }
+
+    std.mem.sort(RemoteTag, tags.items, {}, sortRemoteTagAsc);
+    return tags;
+}
+
+fn ensureFetchedRemoteTagTarballProto(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    package_name: []const u8,
+    tag: RemoteTag,
+    session: git_proto.Session,
+    stats: *types.SyncStats,
+) !void {
+    const pkg_dir = try std.fs.path.join(allocator, &.{ root, "p", package_name, "tag" });
+    defer allocator.free(pkg_dir);
+    try shell.runCommand(allocator, &[_][]const u8{ "mkdir", "-p", pkg_dir });
+
+    const tarball_path = try tarballPathFor(allocator, root, package_name, tag.name);
+    defer allocator.free(tarball_path);
+    if (pathExists(tarball_path)) {
+        stats.tarballs_present += 1;
+        std.log.info("tarball present package={s} tag={s}", .{ package_name, tag.name });
+        return;
+    }
+
+    const tmp_root = try std.fmt.allocPrint(allocator, "/tmp/packbase-fetch-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(tmp_root);
+    defer std.fs.deleteTreeAbsolute(tmp_root) catch {};
+
+    const repo_path = try std.fs.path.join(allocator, &.{ tmp_root, "repo" });
+    defer allocator.free(repo_path);
+    try shell.runCommand(allocator, &.{ "git", "init", "--quiet", repo_path });
+
+    const response_buffer = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(response_buffer);
+    const want = try std.fmt.allocPrint(allocator, "{x}", .{tag.target.slice()});
+    defer allocator.free(want);
+
+    var fetch_stream: git_proto.Session.FetchStream = undefined;
+    try session.fetch(&fetch_stream, &.{want}, response_buffer);
+    defer fetch_stream.deinit();
+
+    const pack_bytes = try fetch_stream.reader.allocRemaining(allocator, .limited(512 * 1024 * 1024));
+    defer allocator.free(pack_bytes);
+
+    const pack_dir = try std.fs.path.join(allocator, &.{ repo_path, ".git", "objects", "pack" });
+    defer allocator.free(pack_dir);
+    try shell.runCommand(allocator, &.{ "mkdir", "-p", pack_dir });
+    const pack_path = try std.fs.path.join(allocator, &.{ pack_dir, "packbase.pack" });
+    defer allocator.free(pack_path);
+    {
+        var pack_file = try std.fs.cwd().createFile(pack_path, .{ .truncate = true });
+        defer pack_file.close();
+        try pack_file.writeAll(pack_bytes);
+    }
+
+    const commit = try std.fmt.allocPrint(allocator, "{x}", .{tag.target.slice()});
+    defer allocator.free(commit);
+    try shell.runCommand(allocator, &.{ "git", "-C", repo_path, "index-pack", ".git/objects/pack/packbase.pack" });
+    try shell.runCommand(allocator, &.{ "git", "-C", repo_path, "checkout", "--quiet", "--detach", commit });
+    std.fs.deleteTreeAbsolute(try std.fs.path.join(allocator, &.{ repo_path, ".git" })) catch {};
+
+    try shell.runCommand(allocator, &.{
+        "tar",
+        "--sort=name",
+        "--mtime=@0",
+        "--owner=0",
+        "--group=0",
+        "--numeric-owner",
+        "-czf",
+        tarball_path,
+        "-C",
+        repo_path,
+        ".",
+    });
+
+    stats.tarballs_created += 1;
+    std.log.info("tarball created package={s} tag={s}", .{ package_name, tag.name });
+}
+
+fn freeRemoteTagList(allocator: std.mem.Allocator, tags: *std.ArrayList(RemoteTag)) void {
+    for (tags.items) |tag| allocator.free(tag.name);
+    tags.deinit(allocator);
+}
+
+fn sortRemoteTagAsc(_: void, a: RemoteTag, b: RemoteTag) bool {
+    return std.mem.lessThan(u8, a.name, b.name);
+}
+
+fn tarballPathFor(allocator: std.mem.Allocator, root: []const u8, package_name: []const u8, tag: []const u8) ![]u8 {
+    const tarball_name = try std.fmt.allocPrint(allocator, "{s}.tar.gz", .{tag});
+    defer allocator.free(tarball_name);
+    return std.fs.path.join(allocator, &.{ root, "p", package_name, "tag", tarball_name });
+}
+
+fn isHttpGitUrl(url: []const u8) bool {
+    return std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://");
 }
 
 fn archiveGitTag(allocator: std.mem.Allocator, repo_path: []const u8, tag: []const u8, tarball_path: []const u8) !void {
