@@ -54,6 +54,8 @@ pub const SyncStats = struct {
     rate_limited: bool = false,
     retry_after: i64 = 0,
     queued: bool = false,
+    packages_total: usize = 0,
+    packages_probed: usize = 0,
 };
 
 pub const PackageTagInfo = struct {

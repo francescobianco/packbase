@@ -12,7 +12,7 @@ TARGET_DIR="$TMP_DIR/remote-clone"
 FETCH_DIR=""
 FETCH_REPEAT_DIR=""
 BATCH_FETCH_DIR=""
-INFO_URL="${SCHEME}://${DOMAIN}/api/info"
+INFO_URL="${SCHEME}://${DOMAIN}/api/status"
 LIST_URL="${SCHEME}://${DOMAIN}/api/list"
 UPDATE_URL="${SCHEME}://${DOMAIN}/api/update"
 PACKAGE_INFO_URL_BASE="${SCHEME}://${DOMAIN}/api/info"
@@ -42,8 +42,8 @@ rm -rf "$TARGET_DIR"
 mkdir -p "$TMP_DIR"
 
 if ! RELEASE_RESP="$(curl -fsS "$INFO_URL")"; then
-    printf 'remote info endpoint not available: %s\n' "$INFO_URL" >&2
-    printf 'expected a deployed packbase instance exposing /api/info\n' >&2
+    printf 'remote status endpoint not available: %s\n' "$INFO_URL" >&2
+    printf 'expected a deployed packbase instance exposing /api/status\n' >&2
     exit 1
 fi
 

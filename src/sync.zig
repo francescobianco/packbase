@@ -57,6 +57,11 @@ pub fn finishUpdateWindow(allocator: std.mem.Allocator, root: []const u8, stats:
     }
 }
 
+pub fn writeUpdateProgress(allocator: std.mem.Allocator, root: []const u8, stats: *const types.SyncStats) !void {
+    const now = std.time.timestamp();
+    try writeUpdateStatus(allocator, root, "running", now, now, stats);
+}
+
 pub fn readUpdateStatusJson(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     const state_dir = try ensureStateDir(allocator, root);
     defer allocator.free(state_dir);
@@ -1054,8 +1059,8 @@ fn injectRepoSyncStats(allocator: std.mem.Allocator, base_body: []const u8, stat
 
     const suffix = try std.fmt.allocPrint(
         allocator,
-        ",\"source_repo_cloned\":{d},\"source_repo_updated\":{d},\"source_repo_failed\":{d}}}\n",
-        .{ stats.source_repo_cloned, stats.source_repo_updated, stats.source_repo_failed },
+        ",\"source_repo_cloned\":{d},\"source_repo_updated\":{d},\"source_repo_failed\":{d},\"packages_total\":{d},\"packages_probed\":{d}}}\n",
+        .{ stats.source_repo_cloned, stats.source_repo_updated, stats.source_repo_failed, stats.packages_total, stats.packages_probed },
     );
     defer allocator.free(suffix);
 

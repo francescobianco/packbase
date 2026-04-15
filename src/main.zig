@@ -192,8 +192,12 @@ fn handleConnection(
         try handleCheckPackage(allocator, connection, root, path["/api/check/".len..], head_only);
         return;
     }
+    if (std.mem.eql(u8, path, "/api/status")) {
+        try handleStatus(allocator, connection, root, head_only);
+        return;
+    }
     if (std.mem.eql(u8, path, "/api/info")) {
-        try handleInfo(allocator, connection, root, head_only);
+        try http.sendSimpleResponse(connection, "404 Not Found", "text/plain", "use /api/status for server status or /api/info/<package> for package info\n");
         return;
     }
     if (std.mem.eql(u8, path, "/")) {
@@ -511,6 +515,12 @@ fn updateWorker(args: *UpdateWorkerArgs) void {
     };
     defer sync.freePackageInfoList(allocator, &package_infos);
 
+    stats.packages_total = package_infos.items.len;
+    stats.packages_probed = 0;
+    sync.writeUpdateProgress(allocator, root, &stats) catch |err| {
+        std.log.warn("progress write failed: {s}", .{@errorName(err)});
+    };
+
     const updated_at = std.time.timestamp();
     for (package_infos.items) |*info| {
         info.updated_at = updated_at;
@@ -518,6 +528,8 @@ fn updateWorker(args: *UpdateWorkerArgs) void {
 
         var probe = probePseudoGitFetchability(allocator, root, info.package, info.local) catch |err| {
             std.log.warn("fetch probe failed package={s} error={s}", .{ info.package, @errorName(err) });
+            stats.packages_probed += 1;
+            sync.writeUpdateProgress(allocator, root, &stats) catch {};
             continue;
         };
         defer probe.deinit(allocator);
@@ -526,16 +538,22 @@ fn updateWorker(args: *UpdateWorkerArgs) void {
         if (probe.commit) |commit| {
             info.fetch_probe_commit = allocator.dupe(u8, commit) catch |err| {
                 std.log.warn("commit copy failed package={s} error={s}", .{ info.package, @errorName(err) });
+                stats.packages_probed += 1;
+                sync.writeUpdateProgress(allocator, root, &stats) catch {};
                 continue;
             };
         }
         if (probe.probe_error) |probe_error| {
             info.fetch_probe_error = allocator.dupe(u8, probe_error) catch |err| {
                 std.log.warn("probe error copy failed package={s} error={s}", .{ info.package, @errorName(err) });
+                stats.packages_probed += 1;
+                sync.writeUpdateProgress(allocator, root, &stats) catch {};
                 continue;
             };
         }
         info.healthy = info.local and info.tarball_count != 0 and info.pseudo_git_fetchable;
+        stats.packages_probed += 1;
+        sync.writeUpdateProgress(allocator, root, &stats) catch {};
     }
 
     sync.writePackageInfoSnapshot(allocator, root, package_infos.items) catch |err| {
@@ -572,7 +590,7 @@ fn handleList(
     if (!head_only) try connection.stream.writeAll(body);
 }
 
-fn handleInfo(
+fn handleStatus(
     allocator: std.mem.Allocator,
     connection: *std.net.Server.Connection,
     root: []const u8,
@@ -700,7 +718,7 @@ fn validatePseudoGitFetchability(
         _ = helper.wait() catch {};
     }
 
-    const info_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api/info", .{helper_port});
+    const info_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api/status", .{helper_port});
     defer allocator.free(info_url);
     var ready = false;
     var attempts: usize = 0;
