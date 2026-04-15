@@ -19,6 +19,7 @@ pub const SourcePackage = struct {
     title: ?[]const u8 = null,
     repository: ?SourceRepository = null,
     github: ?SourceGithub = null,
+    updated_at: ?[]const u8 = null,
 };
 
 pub const SourceRepository = struct {
@@ -35,6 +36,8 @@ pub const SourceRecord = struct {
     repo_url: []u8,
     package_name: []u8,
     default_ref: []u8,
+    updated_at: []u8,
+    fresh: bool = false,
 };
 
 pub const SyncStats = struct {
@@ -51,6 +54,7 @@ pub const SyncStats = struct {
     source_repo_cloned: usize = 0,
     source_repo_updated: usize = 0,
     source_repo_failed: usize = 0,
+    source_skipped: usize = 0,
     rate_limited: bool = false,
     retry_after: i64 = 0,
     queued: bool = false,

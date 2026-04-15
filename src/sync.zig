@@ -116,6 +116,106 @@ pub fn listPackagesJson(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
     return try body.toOwnedSlice(allocator);
 }
 
+pub fn searchPackagesJson(allocator: std.mem.Allocator, root: []const u8, query: []const u8) ![]u8 {
+    var local_names = try collectLocalPackageNames(allocator, root);
+    defer {
+        for (local_names.items) |name| allocator.free(name);
+        local_names.deinit(allocator);
+    }
+
+    var registered_names = try collectRegisteredPackageNames(allocator, root);
+    defer {
+        for (registered_names.items) |name| allocator.free(name);
+        registered_names.deinit(allocator);
+    }
+
+    std.mem.sort([]u8, local_names.items, {}, sortStringAsc);
+    std.mem.sort([]u8, registered_names.items, {}, sortStringAsc);
+
+    var merged = std.ArrayList([]u8).empty;
+    defer merged.deinit(allocator);
+    try appendMergedNames(allocator, &merged, local_names.items, registered_names.items);
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+
+    try body.appendSlice(allocator, "{\"query\":");
+    try appendJsonString(allocator, &body, query);
+    try body.appendSlice(allocator, ",\"packages\":[");
+    var first = true;
+    for (merged.items) |name| {
+        if (!containsCaseInsensitive(name, query)) continue;
+        if (!first) try body.append(allocator, ',');
+        first = false;
+        try appendJsonString(allocator, &body, name);
+    }
+    try body.appendSlice(allocator, "]}\n");
+
+    return try body.toOwnedSlice(allocator);
+}
+
+fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+pub const SnapshotProbeData = struct {
+    pseudo_git_fetchable: bool,
+    fetch_probe_commit: ?[]u8,
+    fetch_probe_error: ?[]u8,
+    healthy: bool,
+};
+
+pub fn loadSnapshotProbeData(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+) !std.StringHashMap(SnapshotProbeData) {
+    var map = std.StringHashMap(SnapshotProbeData).init(allocator);
+    errdefer freeSnapshotProbeData(allocator, &map);
+
+    const state_dir = try ensureStateDir(allocator, root);
+    defer allocator.free(state_dir);
+    const snapshot_path = try std.fs.path.join(allocator, &.{ state_dir, "package-info.json" });
+    defer allocator.free(snapshot_path);
+
+    const raw = (try readOptionalFileAlloc(allocator, snapshot_path, 32 * 1024 * 1024)) orelse return map;
+    defer allocator.free(raw);
+
+    const parsed = try std.json.parseFromSlice(types.PackageInfoSnapshot, allocator, raw, .{});
+    defer parsed.deinit();
+
+    for (parsed.value.packages) |info| {
+        const key = try allocator.dupe(u8, info.package);
+        errdefer allocator.free(key);
+        const commit = if (info.fetch_probe_commit) |c| try allocator.dupe(u8, c) else null;
+        errdefer if (commit) |c| allocator.free(c);
+        const probe_err = if (info.fetch_probe_error) |e| try allocator.dupe(u8, e) else null;
+        errdefer if (probe_err) |e| allocator.free(e);
+        try map.put(key, .{
+            .pseudo_git_fetchable = info.pseudo_git_fetchable,
+            .fetch_probe_commit = commit,
+            .fetch_probe_error = probe_err,
+            .healthy = info.healthy,
+        });
+    }
+    return map;
+}
+
+pub fn freeSnapshotProbeData(allocator: std.mem.Allocator, map: *std.StringHashMap(SnapshotProbeData)) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        if (entry.value_ptr.fetch_probe_commit) |c| allocator.free(c);
+        if (entry.value_ptr.fetch_probe_error) |e| allocator.free(e);
+    }
+    map.deinit();
+}
+
 pub fn collectPackageInfos(allocator: std.mem.Allocator, root: []const u8) !std.ArrayList(types.PackageInfo) {
     var local_names = try collectLocalPackageNames(allocator, root);
     defer {
@@ -289,6 +389,28 @@ pub fn syncSourceCatalog(
         .{ stats.source_packages, changed },
     );
 
+    // Per-package updated_at cache: mark records as fresh when unchanged.
+    const ts_dir = try std.fs.path.join(allocator, &.{ state_dir, "pkg-ts" });
+    defer allocator.free(ts_dir);
+    try shell.runCommand(allocator, &[_][]const u8{ "mkdir", "-p", ts_dir });
+    for (new_records.items) |*record| {
+        const ts_path = try std.fs.path.join(allocator, &.{ ts_dir, record.id });
+        defer allocator.free(ts_path);
+        const current_ts = std.mem.trim(u8, record.updated_at, " \t\r\n");
+        if (current_ts.len > 0) {
+            const stored_ts: ?[]u8 = readOptionalFileAlloc(allocator, ts_path, 128) catch null;
+            defer if (stored_ts) |ts| allocator.free(ts);
+            if (stored_ts) |ts| {
+                if (std.mem.eql(u8, std.mem.trim(u8, ts, " \t\r\n"), current_ts)) {
+                    record.fresh = true;
+                    stats.source_skipped += 1;
+                }
+            }
+        }
+        writeTextFile(ts_path, record.updated_at) catch {};
+    }
+    std.log.info("source catalog skipped packages={d}", .{stats.source_skipped});
+
     if (old_raw) |old| {
         if (changed) {
             var old_records = try extractSourceRecords(allocator, old);
@@ -352,6 +474,7 @@ pub fn lookupSourceRecordByPackage(
             .repo_url = try allocator.dupe(u8, record.repo_url),
             .package_name = try allocator.dupe(u8, record.package_name),
             .default_ref = try allocator.dupe(u8, record.default_ref),
+            .updated_at = try allocator.dupe(u8, record.updated_at),
         };
     }
     return null;
@@ -362,6 +485,7 @@ pub fn freeSourceRecord(allocator: std.mem.Allocator, record: *types.SourceRecor
     allocator.free(record.repo_url);
     allocator.free(record.package_name);
     allocator.free(record.default_ref);
+    allocator.free(record.updated_at);
     record.* = undefined;
 }
 
@@ -676,6 +800,7 @@ fn extractSourceRecords(allocator: std.mem.Allocator, raw: []const u8) !std.Arra
                 try allocator.dupe(u8, repo.default_ref orelse "")
             else
                 try allocator.dupe(u8, ""),
+            .updated_at = try allocator.dupe(u8, pkg.updated_at orelse ""),
         });
     }
 
@@ -689,6 +814,7 @@ fn freeSourceRecords(allocator: std.mem.Allocator, records: *std.ArrayList(types
         allocator.free(record.repo_url);
         allocator.free(record.package_name);
         allocator.free(record.default_ref);
+        allocator.free(record.updated_at);
     }
     records.deinit(allocator);
 }
@@ -763,13 +889,14 @@ fn writeRegisteredSnapshot(allocator: std.mem.Allocator, path: []const u8, recor
 fn writeSourceDiffSnapshot(allocator: std.mem.Allocator, path: []const u8, stats: *const types.SyncStats) !void {
     const body = try std.fmt.allocPrint(
         allocator,
-        "{{\"source_changed\":{s},\"source_packages\":{d},\"source_added\":{d},\"source_updated\":{d},\"source_removed\":{d},\"source_repo_cloned\":{d},\"source_repo_updated\":{d},\"source_repo_failed\":{d}}}\n",
+        "{{\"source_changed\":{s},\"source_packages\":{d},\"source_added\":{d},\"source_updated\":{d},\"source_removed\":{d},\"source_skipped\":{d},\"source_repo_cloned\":{d},\"source_repo_updated\":{d},\"source_repo_failed\":{d}}}\n",
         .{
             if (stats.source_changed) "true" else "false",
             stats.source_packages,
             stats.source_added,
             stats.source_changed_count,
             stats.source_removed,
+            stats.source_skipped,
             stats.source_repo_cloned,
             stats.source_repo_updated,
             stats.source_repo_failed,
@@ -1059,8 +1186,8 @@ fn injectRepoSyncStats(allocator: std.mem.Allocator, base_body: []const u8, stat
 
     const suffix = try std.fmt.allocPrint(
         allocator,
-        ",\"source_repo_cloned\":{d},\"source_repo_updated\":{d},\"source_repo_failed\":{d},\"packages_total\":{d},\"packages_probed\":{d}}}\n",
-        .{ stats.source_repo_cloned, stats.source_repo_updated, stats.source_repo_failed, stats.packages_total, stats.packages_probed },
+        ",\"source_repo_cloned\":{d},\"source_repo_updated\":{d},\"source_repo_failed\":{d},\"source_skipped\":{d},\"packages_total\":{d},\"packages_probed\":{d}}}\n",
+        .{ stats.source_repo_cloned, stats.source_repo_updated, stats.source_repo_failed, stats.source_skipped, stats.packages_total, stats.packages_probed },
     );
     defer allocator.free(suffix);
 

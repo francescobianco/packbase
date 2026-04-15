@@ -184,6 +184,11 @@ fn handleConnection(
         try handleList(allocator, connection, root, head_only);
         return;
     }
+    if (std.mem.startsWith(u8, path, "/api/search")) {
+        const q = parseQueryParam(path, "q") orelse "";
+        try handleSearch(allocator, connection, root, q, head_only);
+        return;
+    }
     if (std.mem.startsWith(u8, path, "/api/info/")) {
         try handlePackageInfo(allocator, connection, root, path["/api/info/".len..], head_only);
         return;
@@ -515,6 +520,17 @@ fn updateWorker(args: *UpdateWorkerArgs) void {
     };
     defer sync.freePackageInfoList(allocator, &package_infos);
 
+    // Build set of fresh package names (unchanged updated_at from source)
+    var fresh_packages = std.StringHashMap(void).init(allocator);
+    defer fresh_packages.deinit();
+    for (source_records.items) |record| {
+        if (record.fresh) fresh_packages.put(record.package_name, {}) catch {};
+    }
+
+    // Load previous probe snapshot (used to reuse results for fresh packages)
+    var prev_probes = sync.loadSnapshotProbeData(allocator, root) catch std.StringHashMap(sync.SnapshotProbeData).init(allocator);
+    defer sync.freeSnapshotProbeData(allocator, &prev_probes);
+
     stats.packages_total = package_infos.items.len;
     stats.packages_probed = 0;
     sync.writeUpdateProgress(allocator, root, &stats) catch |err| {
@@ -525,6 +541,25 @@ fn updateWorker(args: *UpdateWorkerArgs) void {
     for (package_infos.items) |*info| {
         info.updated_at = updated_at;
         info.smart_http_ready = info.tarball_count != 0;
+
+        // Skip probe when upstream updated_at is unchanged: reuse previous result.
+        if (fresh_packages.contains(info.package)) {
+            if (prev_probes.get(info.package)) |prev| {
+                info.pseudo_git_fetchable = prev.pseudo_git_fetchable;
+                info.fetch_probe_commit = if (prev.fetch_probe_commit) |c|
+                    allocator.dupe(u8, c) catch null
+                else
+                    null;
+                info.fetch_probe_error = if (prev.fetch_probe_error) |e|
+                    allocator.dupe(u8, e) catch null
+                else
+                    null;
+                info.healthy = prev.healthy;
+            }
+            stats.packages_probed += 1;
+            sync.writeUpdateProgress(allocator, root, &stats) catch {};
+            continue;
+        }
 
         var probe = probePseudoGitFetchability(allocator, root, info.package, info.local) catch |err| {
             std.log.warn("fetch probe failed package={s} error={s}", .{ info.package, @errorName(err) });
@@ -577,6 +612,18 @@ fn updateWorker(args: *UpdateWorkerArgs) void {
     );
 }
 
+fn parseQueryParam(path: []const u8, param: []const u8) ?[]const u8 {
+    const q_pos = std.mem.indexOfScalar(u8, path, '?') orelse return null;
+    const query = path[q_pos + 1 ..];
+    var parts = std.mem.splitScalar(u8, query, '&');
+    while (parts.next()) |part| {
+        if (part.len > param.len and part[param.len] == '=' and std.mem.eql(u8, part[0..param.len], param)) {
+            return part[param.len + 1 ..];
+        }
+    }
+    return null;
+}
+
 fn handleList(
     allocator: std.mem.Allocator,
     connection: *std.net.Server.Connection,
@@ -584,6 +631,20 @@ fn handleList(
     head_only: bool,
 ) !void {
     const body = try sync.listPackagesJson(allocator, root);
+    defer allocator.free(body);
+
+    try http.writeHeaders(connection, "200 OK", "application/json", body.len);
+    if (!head_only) try connection.stream.writeAll(body);
+}
+
+fn handleSearch(
+    allocator: std.mem.Allocator,
+    connection: *std.net.Server.Connection,
+    root: []const u8,
+    query: []const u8,
+    head_only: bool,
+) !void {
+    const body = try sync.searchPackagesJson(allocator, root, query);
     defer allocator.free(body);
 
     try http.writeHeaders(connection, "200 OK", "application/json", body.len);
