@@ -246,6 +246,11 @@ pub fn sendLandingPage(allocator: std.mem.Allocator, connection: *std.net.Server
         \\        </tr>
         \\        <tr>
         \\          <td><span class="method get">GET</span></td>
+        \\          <td><code>/api/search?q=&lt;query&gt;</code></td>
+        \\          <td>Filter packages by name (case-insensitive substring match).</td>
+        \\        </tr>
+        \\        <tr>
+        \\          <td><span class="method get">GET</span></td>
         \\          <td><code>/api/status</code></td>
         \\          <td>Return service metadata including the current release id.</td>
         \\        </tr>
