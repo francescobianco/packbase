@@ -935,10 +935,6 @@ fn ensureFetchedRemoteTagTarballProto(
 
     try shell.runCommand(allocator, &.{
         "tar",
-        "--sort=name",
-        "--mtime=@0",
-        "--owner=0",
-        "--group=0",
         "--numeric-owner",
         "-czf",
         tarball_path,
