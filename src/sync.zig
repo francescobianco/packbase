@@ -1502,28 +1502,29 @@ fn collectTarballInfos(allocator: std.mem.Allocator, tarball_dir: []const u8) !s
         const tag_name = entry.name[0 .. entry.name.len - ".tar.gz".len];
         const manifest_name = try std.fmt.allocPrint(allocator, "{s}.manifest.json", .{tag_name});
         defer allocator.free(manifest_name);
-        const manifest = blk: {
-            var manifest_file = dir.openFile(manifest_name, .{}) catch |err| switch (err) {
-                error.FileNotFound => break :blk null,
-                else => return err,
-            };
-            defer manifest_file.close();
-            const raw = try manifest_file.readToEndAlloc(allocator, 64 * 1024);
-            defer allocator.free(raw);
-            const parsed = try std.json.parseFromSlice(TarballManifest, allocator, raw, .{});
-            defer parsed.deinit();
-            break :blk parsed.value;
-        };
-        try tags.append(allocator, .{
+        var tag_info: types.PackageTagInfo = .{
             .tag = try allocator.dupe(u8, tag_name),
             .size_bytes = @intCast(stat.size),
-            .manifest_present = manifest != null,
-            .git_commit_oid = if (manifest) |m| try allocator.dupe(u8, m.git_commit_oid) else null,
-            .git_tree_oid = if (manifest) |m| if (m.git_tree_oid) |oid| try allocator.dupe(u8, oid) else null else null,
-            .tarball_sha256 = if (manifest) |m| try allocator.dupe(u8, m.tarball_sha256) else null,
-            .tarball_md5 = if (manifest) |m| try allocator.dupe(u8, m.tarball_md5) else null,
-            .tarball_crc32 = if (manifest) |m| try allocator.dupe(u8, m.tarball_crc32) else null,
-        });
+        };
+        var manifest_file = dir.openFile(manifest_name, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                try tags.append(allocator, tag_info);
+                continue;
+            },
+            else => return err,
+        };
+        defer manifest_file.close();
+        const raw = try manifest_file.readToEndAlloc(allocator, 64 * 1024);
+        defer allocator.free(raw);
+        const parsed = try std.json.parseFromSlice(TarballManifest, allocator, raw, .{});
+        defer parsed.deinit();
+        tag_info.manifest_present = true;
+        tag_info.git_commit_oid = try allocator.dupe(u8, parsed.value.git_commit_oid);
+        tag_info.git_tree_oid = if (parsed.value.git_tree_oid) |oid| try allocator.dupe(u8, oid) else null;
+        tag_info.tarball_sha256 = try allocator.dupe(u8, parsed.value.tarball_sha256);
+        tag_info.tarball_md5 = try allocator.dupe(u8, parsed.value.tarball_md5);
+        tag_info.tarball_crc32 = try allocator.dupe(u8, parsed.value.tarball_crc32);
+        try tags.append(allocator, tag_info);
     }
     return tags;
 }
