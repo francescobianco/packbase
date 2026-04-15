@@ -17,6 +17,7 @@ pub const SourceSnapshot = struct {
 pub const SourcePackage = struct {
     id: []const u8,
     title: ?[]const u8 = null,
+    language: ?[]const u8 = null,
     repository: ?SourceRepository = null,
     github: ?SourceGithub = null,
     updated_at: ?[]const u8 = null,
@@ -37,6 +38,7 @@ pub const SourceRecord = struct {
     package_name: []u8,
     default_ref: []u8,
     updated_at: []u8,
+    language: []u8,
     fresh: bool = false,
 };
 

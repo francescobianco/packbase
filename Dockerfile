@@ -31,9 +31,9 @@ COPY --from=build /out/packbase /usr/local/bin/packbase
 RUN mkdir -p /var/lib/packbase/public
 
 ENV PACKBASE_ROOT=/var/lib/packbase/public
-ENV PACKBASE_PORT=8080
+ENV PACKBASE_PORT=9122
 ENV PATH=/opt/zig:$PATH
 
-EXPOSE 8080
+EXPOSE 9122
 
 ENTRYPOINT ["/usr/local/bin/packbase"]

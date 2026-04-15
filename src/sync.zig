@@ -433,6 +433,51 @@ pub fn readPackageInfoJson(allocator: std.mem.Allocator, root: []const u8, packa
     return null;
 }
 
+/// Returns a JSON object mapping language → package count, e.g. `{"zig":10,"shell":3}`.
+/// Returns `"{}"` on any error.
+pub fn readLanguageStatsJson(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    const state_dir = ensureStateDir(allocator, root) catch return allocator.dupe(u8, "{}");
+    defer allocator.free(state_dir);
+    const current_path = std.fs.path.join(allocator, &.{ state_dir, "source.json" }) catch return allocator.dupe(u8, "{}");
+    defer allocator.free(current_path);
+
+    const raw = (readOptionalFileAlloc(allocator, current_path, 16 * 1024 * 1024) catch return allocator.dupe(u8, "{}")) orelse
+        return allocator.dupe(u8, "{}");
+    defer allocator.free(raw);
+
+    var records = extractSourceRecords(allocator, raw) catch return allocator.dupe(u8, "{}");
+    defer freeSourceRecords(allocator, &records);
+
+    var counts = std.StringHashMap(usize).init(allocator);
+    defer {
+        var it = counts.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        counts.deinit();
+    }
+
+    for (records.items) |record| {
+        const entry = try counts.getOrPut(record.language);
+        if (!entry.found_existing) {
+            entry.key_ptr.* = try allocator.dupe(u8, record.language);
+            entry.value_ptr.* = 0;
+        }
+        entry.value_ptr.* += 1;
+    }
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try body.append(allocator, '{');
+    var first = true;
+    var it = counts.iterator();
+    while (it.next()) |entry| {
+        if (!first) try body.append(allocator, ',');
+        first = false;
+        try body.writer(allocator).print("\"{s}\":{d}", .{ entry.key_ptr.*, entry.value_ptr.* });
+    }
+    try body.append(allocator, '}');
+    return body.toOwnedSlice(allocator);
+}
+
 pub fn syncPackages(allocator: std.mem.Allocator, root: []const u8) !types.SyncStats {
     var stats = types.SyncStats{};
     try scanAndSyncRepos(allocator, root, &stats);
@@ -658,6 +703,7 @@ pub fn lookupSourceRecordByPackage(
             .package_name = try allocator.dupe(u8, record.package_name),
             .default_ref = try allocator.dupe(u8, record.default_ref),
             .updated_at = try allocator.dupe(u8, record.updated_at),
+            .language = try allocator.dupe(u8, record.language),
         };
     }
     return null;
@@ -669,7 +715,19 @@ pub fn freeSourceRecord(allocator: std.mem.Allocator, record: *types.SourceRecor
     allocator.free(record.package_name);
     allocator.free(record.default_ref);
     allocator.free(record.updated_at);
+    allocator.free(record.language);
     record.* = undefined;
+}
+
+pub fn lookupPackageLanguage(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    package_name: []const u8,
+) ![]u8 {
+    var record = (try lookupSourceRecordByPackage(allocator, root, package_name)) orelse
+        return allocator.dupe(u8, "shell");
+    defer freeSourceRecord(allocator, &record);
+    return allocator.dupe(u8, record.language);
 }
 
 fn ensureStateDir(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
@@ -1401,6 +1459,10 @@ fn extractSourceRecords(allocator: std.mem.Allocator, raw: []const u8) !std.Arra
             else
                 try allocator.dupe(u8, ""),
             .updated_at = try allocator.dupe(u8, pkg.updated_at orelse ""),
+            .language = if (pkg.language) |lang|
+                try allocator.dupe(u8, lang)
+            else
+                try allocator.dupe(u8, "shell"),
         });
     }
 
@@ -1415,6 +1477,7 @@ fn freeSourceRecords(allocator: std.mem.Allocator, records: *std.ArrayList(types
         allocator.free(record.package_name);
         allocator.free(record.default_ref);
         allocator.free(record.updated_at);
+        allocator.free(record.language);
     }
     records.deinit(allocator);
 }

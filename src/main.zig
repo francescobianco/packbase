@@ -37,7 +37,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const root = std.posix.getenv("PACKBASE_ROOT") orelse "public";
-    const port_text = std.posix.getenv("PACKBASE_PORT") orelse "8080";
+    const port_text = std.posix.getenv("PACKBASE_PORT") orelse "9122";
     const token = std.posix.getenv("PACKBASE_TOKEN");
     const source_url = std.posix.getenv("PACKBASE_SOURCE") orelse "https://zub.javanile.org/packbase.json";
     const port = try std.fmt.parseInt(u16, port_text, 10);
@@ -177,7 +177,7 @@ fn handleConnection(
             return;
         }
         if (std.mem.eql(u8, path, "/api/check")) {
-            try handleCheckPackagePost(allocator, connection, root, raw, head_only);
+            try handleCheckPackagePost(allocator, connection, root, token, raw, head_only);
             return;
         }
     }
@@ -487,10 +487,12 @@ fn handleStatus(
     const update_status = try sync.readUpdateStatusJson(allocator, root);
     defer allocator.free(update_status);
     const package_health = try sync.readPackageHealthSummary(allocator, root);
+    const lang_stats = try sync.readLanguageStatsJson(allocator, root);
+    defer allocator.free(lang_stats);
     const body = try std.fmt.allocPrint(
         allocator,
-        "{{\"service\":\"packbase\",\"release\":\"{s}\",\"packages_total\":{d},\"packages_healthy\":{d},\"packages_unhealthy\":{d},\"update\":{s}}}\n",
-        .{ release_id, package_health.total, package_health.healthy, package_health.unhealthy, update_status },
+        "{{\"service\":\"packbase\",\"release\":\"{s}\",\"packages_total\":{d},\"packages_healthy\":{d},\"packages_unhealthy\":{d},\"languages\":{s},\"update\":{s}}}\n",
+        .{ release_id, package_health.total, package_health.healthy, package_health.unhealthy, lang_stats, update_status },
     );
     defer allocator.free(body);
 
@@ -498,13 +500,22 @@ fn handleStatus(
     if (!head_only) try connection.stream.writeAll(body);
 }
 
+fn probeShellPackage(allocator: std.mem.Allocator, repo_url: []const u8) bool {
+    if (repo_url.len == 0) return false;
+    shell.runCommand(allocator, &.{ "curl", "-fsS", "--head", "--max-time", "10", repo_url }) catch return false;
+    return true;
+}
+
 fn handleCheckPackagePost(
     allocator: std.mem.Allocator,
     connection: *std.net.Server.Connection,
     root: []const u8,
+    token: ?[]const u8,
     raw: []const u8,
     head_only: bool,
 ) !void {
+    if (!try authorizeRequest(connection, token, raw)) return;
+
     const body_raw = http.findBody(raw);
     if (body_raw.len == 0) {
         try http.sendSimpleResponse(connection, "400 Bad Request", "text/plain", "empty body\n");
@@ -516,7 +527,62 @@ fn handleCheckPackagePost(
         return;
     };
     defer parsed.deinit();
-    try handleCheckPackage(allocator, connection, root, parsed.value.package, head_only);
+
+    const package_name = parsed.value.package;
+    if (package_name.len == 0 or std.mem.indexOfScalar(u8, package_name, '/') != null) {
+        try http.sendSimpleResponse(connection, "400 Bad Request", "text/plain", "invalid package name\n");
+        return;
+    }
+
+    // Look up language; default is "shell" for packages with no catalog entry.
+    const language = sync.lookupPackageLanguage(allocator, root, package_name) catch
+        try allocator.dupe(u8, "shell");
+    defer allocator.free(language);
+
+    // Look up the source record for the repo URL (needed for shell probe).
+    var source_record = sync.lookupSourceRecordByPackage(allocator, root, package_name) catch null;
+    defer if (source_record) |*sr| sync.freeSourceRecord(allocator, sr);
+
+    // Run the language-appropriate probe.
+    const is_zig = std.ascii.eqlIgnoreCase(language, "zig");
+    const probe_ok: bool = blk: {
+        if (is_zig) {
+            var probe = probePseudoGitFetchability(allocator, root, package_name, true) catch break :blk false;
+            defer probe.deinit(allocator);
+            break :blk probe.pseudo_git_fetchable;
+        } else {
+            const repo_url: []const u8 = if (source_record) |sr| sr.repo_url else "";
+            break :blk probeShellPackage(allocator, repo_url);
+        }
+    };
+
+    // Build a JSON response that extends the stored package info with the live probe result.
+    const stored_body = sync.readPackageInfoJson(allocator, root, package_name) catch null;
+    defer if (stored_body) |b| allocator.free(b);
+
+    if (stored_body == null) {
+        const not_found = try std.fmt.allocPrint(
+            allocator,
+            "{{\"status\":\"not_found\",\"package\":\"{s}\",\"language\":\"{s}\",\"probe_ok\":{s}}}\n",
+            .{ package_name, language, if (probe_ok) "true" else "false" },
+        );
+        defer allocator.free(not_found);
+        try http.writeHeaders(connection, "404 Not Found", "application/json", not_found.len);
+        if (!head_only) try connection.stream.writeAll(not_found);
+        return;
+    }
+
+    // Strip trailing newline/} from stored JSON and append live probe fields.
+    var base = std.mem.trimRight(u8, stored_body.?, " \t\r\n");
+    if (std.mem.endsWith(u8, base, "}")) base = base[0 .. base.len - 1];
+    const result = try std.fmt.allocPrint(
+        allocator,
+        "{s},\"language\":\"{s}\",\"live_probe_ok\":{s}}}\n",
+        .{ base, language, if (probe_ok) "true" else "false" },
+    );
+    defer allocator.free(result);
+    try http.writeHeaders(connection, "200 OK", "application/json", result.len);
+    if (!head_only) try connection.stream.writeAll(result);
 }
 
 fn handleCheckPackage(
@@ -555,8 +621,18 @@ fn handleCheckPackage(
     };
     defer allocator.free(body);
 
-    try http.writeHeaders(connection, "200 OK", "application/json", body.len);
-    if (!head_only) try connection.stream.writeAll(body);
+    // Inject language field from the source catalog into the stored JSON.
+    const pkg_language = sync.lookupPackageLanguage(allocator, root, package_name) catch
+        try allocator.dupe(u8, "shell");
+    defer allocator.free(pkg_language);
+
+    var base = std.mem.trimRight(u8, body, " \t\r\n");
+    if (std.mem.endsWith(u8, base, "}")) base = base[0 .. base.len - 1];
+    const enriched = try std.fmt.allocPrint(allocator, "{s},\"language\":\"{s}\"}}\n", .{ base, pkg_language });
+    defer allocator.free(enriched);
+
+    try http.writeHeaders(connection, "200 OK", "application/json", enriched.len);
+    if (!head_only) try connection.stream.writeAll(enriched);
 }
 
 fn handlePackageInfo(
@@ -618,6 +694,7 @@ fn performFetch(
         .package_name = try allocator.dupe(u8, pkg_name),
         .default_ref = try allocator.dupe(u8, ""),
         .updated_at = try allocator.dupe(u8, ""),
+        .language = try allocator.dupe(u8, "shell"),
         .fresh = false,
     };
     defer sync.freeSourceRecord(allocator, @constCast(&record));
@@ -853,7 +930,30 @@ fn handleSmartHttp(
     }
 
     const repo_dir = (try resolveRepoDir(allocator, root, repo_rel)) orelse {
-        try http.sendSimpleResponse(connection, "404 Not Found", "text/plain", "not found\n");
+        // Distinguish "package exists but no tarballs" from "package not found at all"
+        // to give git clients a meaningful error message via the X-Packbase-Error header.
+        const pkg_name = if (std.mem.endsWith(u8, repo_rel, ".git"))
+            repo_rel[0 .. repo_rel.len - 4]
+        else
+            repo_rel;
+        const tag_dir = std.fs.path.join(allocator, &.{ root, "p", pkg_name, "tag" }) catch null;
+        defer if (tag_dir) |d| allocator.free(d);
+        const has_dir = if (tag_dir) |d| blk: {
+            std.fs.cwd().access(d, .{}) catch break :blk false;
+            break :blk true;
+        } else false;
+        const detail = if (has_dir)
+            "package has no tarballs; sync with /api/update or POST /api/fetch\n"
+        else
+            "package not found\n";
+        var hdr_buf: [256]u8 = undefined;
+        const hdr = std.fmt.bufPrint(&hdr_buf,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: {d}\r\nContent-Type: text/plain\r\nX-Packbase-Error: {s}\r\nConnection: close\r\n\r\n{s}",
+            .{ detail.len, detail, detail }) catch {
+            try http.sendSimpleResponse(connection, "404 Not Found", "text/plain", detail);
+            return;
+        };
+        try connection.stream.writeAll(hdr);
         return;
     };
     defer allocator.free(repo_dir);

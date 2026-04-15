@@ -1,145 +1,143 @@
-# NEXTMOVE
+# NEXTMOVE — Session findings and next steps
 
-## Stato rapido
+## What was investigated
 
-- Branch/workspace: ci sono modifiche locali non ancora compilate/deployate dopo `r0014`.
-- Obiettivo corrente: chiudere il bug dei probe `healthy` e il blocco di `POST /api/fetch`.
-- Server target: `pb.yafb.net`
-- Deploy richiesto dal progetto: `make deploy`
+### Root cause of `zig fetch --save git+https://pb.yafb.net/httpz.zig → ProtocolError`
 
-## Problemi confermati
+`zig fetch` uses the git Smart HTTP protocol. When Zig receives any non-200 response from
+the `/info/refs?service=git-upload-pack` endpoint, it maps it to `error.ProtocolError` and
+reports "unable to discover remote git server capabilities: ProtocolError".
 
-### 1. `/api/fetch` resta appesa troppo a lungo
+The server was returning HTTP 404 for `httpz.zig` because the package had **0 tarballs**.
+Without tarballs, `ensureGitCacheFromTarballs` returns `error.FileNotFound`, `resolveRepoDir`
+returns `null`, and `handleSmartHttp` emits a 404.
 
-Causa trovata in `src/main.zig`:
+### Why `httpz.zig` had 0 tarballs
 
-- `handleFetch()` dopo `performFetch()` chiamava ancora `refreshPackageInfoSnapshot(...)`
-- quel refresh faceva probe su **tutti** i package
-- quindi la fetch restava aperta anche se i tarball erano già stati creati
+The source catalog maps `httpz.zig` to `allain/httpz.zig` on GitHub.
+That repository has **no tags** (`curl -s https://api.github.com/repos/allain/httpz.zig/tags`
+returns `[]`). With no tags, `listRemoteTagsProto` returns an empty list,
+`syncSingleSourceRecord` returns `error.NoTagsFound`, and no tarballs are ever created.
 
-Effetto pratico visto su `pb.yafb.net`:
+The "ZigFetchFailed" probe error stored in the snapshot was written by an older version of the
+code that is no longer deployed; it was carried forward via `preserve_probes: true` across
+subsequent syncs.
 
-- `mush-demo` crea i tarball subito
-- la request HTTP resta aperta mentre parte il giro globale di probe
+### Why the package was silently skipped on every sync
 
-### 2. Tutti o quasi i package diventano `healthy=false`
+`syncSourceCatalog` marks a source record as `fresh` when the `updated_at` timestamp matches
+the one stored in `{root}/.packbase/pkg-ts/{id}`. The timestamp is written to that file
+**regardless of whether the sync succeeds**. So once a package fails to produce tarballs, its
+timestamp is stored, and every subsequent sync skips it indefinitely.
 
-Cause trovate:
+## Fixes applied in r0015 / r0016
 
-- il probe storico usava `zig fetch`, ma nel container remoto `zig` non c'è:
-  `sh: zig: not found`
-- la readiness del helper usava `/api/status`, che è fragile perché legge file JSON di stato che durante update possono essere visti in stato transitorio
-- i file di stato in `src/sync.zig` sono scritti con `truncate + write`, quindi non in modo atomico
+| Fix | File | Description |
+|-----|------|-------------|
+| fresh+no-tarballs re-sync | `src/sync.zig` | `syncSourceRepos` now only skips fresh records that **also have tarballs**. Packages whose upstream sync previously failed will be retried. |
+| `POST /api/check` endpoint | `src/main.zig` | Authenticated endpoint that runs a language-appropriate probe and returns the result. |
+| Language-aware probe | `src/main.zig` | "zig" packages: full git-fetch probe via helper server. Other languages (default "shell"): simple HEAD request to the repo URL. |
+| `language` field in source records | `src/types.zig`, `src/sync.zig` | Extracted from the source catalog `language` field; defaults to `"shell"` when absent. |
+| Language in `/api/info` and `/api/check` | `src/main.zig` | The package language is looked up from the source catalog and injected into the response JSON. |
+| Language statistics in `/api/status` | `src/main.zig`, `src/sync.zig` | `"languages"` object in the status response maps each language to its package count. |
+| Better 404 for no-tarballs | `src/main.zig` | When a package exists but has no tarballs, the 404 response body and `X-Packbase-Error` header describe the actual problem. |
+| Default port 9122 | `src/main.zig`, `Dockerfile`, `Dockerfile.prebuilt` | Packbase now defaults to port 9122 instead of 8080. Docker `EXPOSE` updated. |
+| Landing page: `POST /api/check` row | `src/http_helpers.zig` | Added the new endpoint to the API table on the landing page. |
 
-Sintomo osservato nei log remoti:
+## Open issues and next actions
 
-- molti `curl: (52) Empty reply from server`
-- almeno una volta: `warning: request failed: SyntaxError`
+### 1. `httpz.zig` catalog entry points to a tagless repo (data problem)
 
-Interpretazione:
+`allain/httpz.zig` has no tags → no tarballs can ever be created from it.
+The catalog maintainer should update the entry to point to a repo with releases
+(e.g., `karlseguin/httpz.zig` which has many tags).
 
-- il helper parte, ma la sua readiness su `/api/status` è accoppiata a file di stato che possono risultare temporaneamente incoerenti
-- anche se la readiness passasse, il probe con `zig fetch` nel container è comunque sbagliato
+**Action:** update the source at `https://zub.javanile.org/packbase.json` to correct the
+`httpz.zig` entry, or use `POST /api/fetch` with the correct upstream URL directly.
 
-## Modifiche locali già applicate
+### 2. 72 unhealthy packages (many upstream sources fail)
 
-### `src/main.zig`
+After the fresh+no-tarballs fix, the sync re-attempted all unhealthy packages.
+`source_repo_failed: 36` means 36 repos failed to sync.  Likely causes:
+- GitHub 401 (wrong URL format, or rate-limiting without auth)
+- Upstream repos with no tags
+- Network failures
 
-Ho già patchato localmente:
+**Action:** audit `source_repo_failed` packages; some may need `.git` suffix on their URLs,
+or the git protocol User-Agent header to pass GitHub's auth check.
 
-- import di `src/git.zig`
-- `handleFetch()` ora chiama:
-  `refreshPackageInfoSnapshot(..., true)`
-- `updateWorker()` ora chiama:
-  `refreshPackageInfoSnapshot(..., false)`
-- `refreshPackageInfoSnapshot()` ha un nuovo parametro:
-  `preserve_probes: bool`
-- quando `preserve_probes=true`:
-  - aggiorna lo snapshot
-  - preserva i probe precedenti
-  - non rilancia probe globali
-- `validatePseudoGitFetchability()` non usa più `zig fetch`
-- il nuovo probe usa `git_proto.Session.init(...)` + `listRefs(...)`
-- il probe verifica il server pseudo-git con primitive low-level del file `src/git.zig`
+### 3. GitHub Smart HTTP returns 401 without proper User-Agent
 
-Questo allinea il probe alla richiesta architetturale: niente shell Git e niente dipendenza da `zig fetch`.
+`curl -H 'Git-Protocol: version=2' https://github.com/foo/bar/info/refs?...`
+with the default curl user-agent returns 401 in testing, which suggests GitHub requires auth
+or a known git user-agent for some repos.
 
-## Modifiche ancora da fare
+The current `git_proto.Session` uses `zig/<version>` as the User-Agent (from `src/git.zig`
+constant `agent`).  GitHub may reject that.
 
-### `src/sync.zig`
+**Action:** test whether adding `User-Agent: git/2.39.0` to the Session headers unblocks
+GitHub fetches.  See `src/git.zig` `agent` constant and the `getCapabilities` request headers.
 
-Serve ancora una patch importante:
+### 4. `ProtocolError` error message is opaque to end users
 
-- rendere atomiche le scritture di stato
+When Zig sees a non-200 from the git endpoint it always reports
+"unable to discover remote git server capabilities: ProtocolError".  The `X-Packbase-Error`
+header added in r0016 is visible only in `curl -v` output, not in `zig fetch`.
 
-Funzioni da sistemare:
+To surface the error to Zig users:
+- Return HTTP 200 with a git ERR pkt-line when a package has no tarballs
+- Investigate whether `Packet.decode` in `src/git.zig` already handles ERR packets
+- If so, a 200 + ERR pkt body would propagate the message to the Zig user
 
-- `writeTextFile`
-- `writeIntFile`
+### 5. Issue 02 — proper tarball materialisation during `update` (still open)
 
-Approccio consigliato:
+The sync still uses shell Git for some packages (`syncSingleSourceRecordShell`).
+The long-term goal is to replace all shell-git usage with the native `src/git.zig` client
+as described in `docs/issues/02-full-git-clone-to-create-tarballs.md`.
 
-- scrivere su file temporaneo nella stessa directory
-- `fsync` opzionale se vuoi essere più rigoroso
-- `rename` atomica sul path finale
+### 6. Issue 04 — allocator panics under load (still open)
 
-Motivo:
+Intermittent panics under proxy traffic remain unresolved.
+See `docs/issues/04-packbase-crashes-under-proxy-load.md`.
 
-- così eviti JSON troncati durante:
-  - `update.status.json`
-  - `package-info.json`
-  - manifest e altri file scritti da `writeTextFile`
+## Port standardisation
 
-## Verifiche già fatte
+The canonical port for Packbase is **9122**.
 
-### Helper remoto dentro il container
+| Context | Old | New |
+|---------|-----|-----|
+| `PACKBASE_PORT` default | 8080 | 9122 |
+| Dockerfile `EXPOSE` | 8080 | 9122 |
+| Dockerfile `ENV PACKBASE_PORT` | 8080 | 9122 |
+| Dockerfile.prebuilt `EXPOSE` | 8080 | 9122 |
+| Dockerfile.prebuilt `ENV PACKBASE_PORT` | 8080 | 9122 |
 
-Comando provato via `docker compose exec`:
+The production deployment uses `PACKBASE_PORT=8080` set explicitly in `docker-compose.yml`
+(or the environment), so changing the binary default does **not** break the running server.
+Verify `docker-compose.yml` uses an explicit port before relying on the default.
 
-- `/usr/local/bin/packbase` parte correttamente sul helper port
-- `curl http://127.0.0.1:19082/api/status` può rispondere correttamente
+## `POST /api/check` contract
 
-Quindi:
+```
+POST /api/check
+Authorization: Bearer <token>
+Content-Type: application/json
 
-- il problema non è il bind della porta
-- il problema è la combinazione di probe vecchio + stato non atomico + fetch globale
+{"package": "<name>"}
+```
 
-### Probe storico con `zig`
+Response (200 OK):
+```json
+{
+  "<all stored package info fields>",
+  "language": "zig",
+  "live_probe_ok": true
+}
+```
 
-Riproduzione remota:
-
-- `zig fetch --save git+http://127.0.0.1:19082/httpz.zig`
-- esito: `sh: zig: not found`
-
-Questo conferma che il vecchio probe non può essere affidabile nel container attuale.
-
-## Checklist per riprendere
-
-1. Patchare `src/sync.zig` con scritture atomiche.
-2. Eseguire build/test locale:
-   - `zig build`
-3. Deploy:
-   - `make deploy`
-4. Verificare remoto:
-   - `curl -fsS https://pb.yafb.net/api/status`
-   - controllare che `packages_healthy` torni coerente
-5. Verificare fetch reale:
-   - `curl -X POST -H 'Content-Type: application/json' -H 'Authorization: Bearer p4J3ect4SPSxKzXZZgSYXeWnV7H3YtjK' --data '{"url":"https://github.com/francescobianco/mush-demo"}' 'https://pb.yafb.net/api/fetch'`
-6. Verificare che la fetch risponda subito e non resti appesa dopo la creazione dei tarball.
-7. Controllare logs remoti:
-   - sparizione di `curl: (52) Empty reply from server`
-   - sparizione di `SyntaxError` durante i probe
-
-## File toccati in questo ultimo step
-
-- `src/main.zig`
-- `NEXTMOVE.md`
-
-## Nota finale
-
-Il fix logico più importante è già in workspace:
-
-- `fetch` non deve più comportarsi come una mini-`update` globale
-- il probe healthy deve vivere sulle primitive di `src/git.zig`, non su `zig fetch`
-
-Resta da chiudere bene la parte di persistenza atomica in `src/sync.zig`, poi build, deploy e verifica finale su `pb.yafb.net`.
+- Requires the same bearer token as `POST /api/fetch`.
+- The probe is language-aware:
+  - `"zig"`: spawns a helper Packbase process and uses the Zig git client to verify the
+    package is fetchable (`validatePseudoGitFetchability`).
+  - other / `"shell"` (default): `curl --head` to the upstream repo URL.
+- The probe result is **not** persisted to the snapshot; the next `/api/update` will update it.
