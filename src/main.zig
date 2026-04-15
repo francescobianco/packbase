@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const http = @import("http_helpers.zig");
+const git_proto = @import("git.zig");
 const shell = @import("shell.zig");
 const sync = @import("sync.zig");
 
@@ -281,7 +282,7 @@ fn handleFetch(
         else => return err,
     };
 
-    refreshPackageInfoSnapshot(allocator, root, null, null) catch |err| {
+    refreshPackageInfoSnapshot(allocator, root, null, null, true) catch |err| {
         std.log.warn("package info refresh after fetch failed: {s}", .{@errorName(err)});
     };
 
@@ -412,7 +413,7 @@ fn updateWorker(args: *UpdateWorkerArgs) void {
         if (record.fresh) fresh_packages.put(record.package_name, {}) catch {};
     }
 
-    refreshPackageInfoSnapshot(allocator, root, &fresh_packages, &stats) catch |err| {
+    refreshPackageInfoSnapshot(allocator, root, &fresh_packages, &stats, false) catch |err| {
         std.log.warn("package info snapshot write failed: {s}", .{@errorName(err)});
         return;
     };
@@ -613,6 +614,7 @@ fn refreshPackageInfoSnapshot(
     root: []const u8,
     fresh_packages: ?*const std.StringHashMap(void),
     stats: ?*types.SyncStats,
+    preserve_probes: bool,
 ) !void {
     var package_infos = try sync.collectPackageInfos(allocator, root);
     defer sync.freePackageInfoList(allocator, &package_infos);
@@ -632,6 +634,16 @@ fn refreshPackageInfoSnapshot(
     for (package_infos.items) |*info| {
         info.updated_at = updated_at;
         info.smart_http_ready = info.tarball_count != 0;
+
+        if (preserve_probes) {
+            if (prev_probes.get(info.package)) |prev| {
+                info.pseudo_git_fetchable = prev.pseudo_git_fetchable;
+                info.fetch_probe_commit = if (prev.fetch_probe_commit) |c| allocator.dupe(u8, c) catch null else null;
+                info.fetch_probe_error = if (prev.fetch_probe_error) |e| allocator.dupe(u8, e) catch null else null;
+                info.healthy = prev.healthy;
+            }
+            continue;
+        }
 
         if (fresh_packages) |fresh| {
             if (fresh.contains(info.package)) {
@@ -716,66 +728,45 @@ fn validatePseudoGitFetchability(
         _ = helper.wait() catch {};
     }
 
-    const info_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api/status", .{helper_port});
-    defer allocator.free(info_url);
-    var ready = false;
+    const probe_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/{s}", .{ helper_port, package_name });
+    defer allocator.free(probe_url);
+    const response_buffer = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(response_buffer);
+
     var attempts: usize = 0;
     while (attempts < 50) : (attempts += 1) {
-        const info = shell.runCommandOutput(allocator, &.{ "curl", "-fsS", info_url }) catch {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var client: std.http.Client = .{ .allocator = allocator };
+        defer client.deinit();
+
+        const uri = std.Uri.parse(probe_url) catch {
             std.Thread.sleep(100 * std.time.ns_per_ms);
             continue;
         };
-        allocator.free(info);
-        ready = true;
-        break;
+        const session = git_proto.Session.init(arena, &client, uri, response_buffer) catch {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+            continue;
+        };
+
+        var refs: git_proto.Session.RefIterator = undefined;
+        session.listRefs(&refs, .{
+            .ref_prefixes = &.{ "refs/heads/", "refs/tags/" },
+            .include_peeled = true,
+            .buffer = response_buffer,
+        }) catch {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+            continue;
+        };
+        defer refs.deinit();
+
+        if ((try refs.next()) != null) return;
+        return error.HelperRepositoryEmpty;
     }
-    if (!ready) return error.HelperServerUnavailable;
 
-    const probe_dir = try std.fmt.allocPrint(allocator, "/tmp/packbase-fetch-probe-{d}", .{std.time.nanoTimestamp()});
-    defer allocator.free(probe_dir);
-    defer std.fs.deleteTreeAbsolute(probe_dir) catch {};
-    try std.fs.makeDirAbsolute(probe_dir);
-
-    const build_zig = try std.fs.path.join(allocator, &.{ probe_dir, "build.zig" });
-    defer allocator.free(build_zig);
-    const build_zon = try std.fs.path.join(allocator, &.{ probe_dir, "build.zig.zon" });
-    defer allocator.free(build_zon);
-
-    try writeTextFileAbsolute(build_zig,
-        \\const std = @import("std");
-        \\
-        \\pub fn build(_: *std.Build) void {}
-        \\
-    );
-    try writeTextFileAbsolute(build_zon,
-        \\ .{
-        \\     .name = .packbase_probe,
-        \\     .version = "0.0.0",
-        \\     .dependencies = .{},
-        \\     .paths = .{""},
-        \\ }
-        \\
-    );
-
-    const fetch_url = try std.fmt.allocPrint(allocator, "git+http://127.0.0.1:{d}/{s}", .{ helper_port, package_name });
-    defer allocator.free(fetch_url);
-
-    var fetch = std.process.Child.init(&.{ "zig", "fetch", "--save", fetch_url, "--global-cache-dir", ".zig-cache" }, allocator);
-    fetch.stdin_behavior = .Close;
-    fetch.stdout_behavior = .Ignore;
-    fetch.stderr_behavior = .Ignore;
-    fetch.cwd = probe_dir;
-    const term = try fetch.spawnAndWait();
-    switch (term) {
-        .Exited => |code| if (code != 0) return error.ZigFetchFailed,
-        else => return error.ZigFetchFailed,
-    }
-}
-
-fn writeTextFileAbsolute(path: []const u8, content: []const u8) !void {
-    var file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(content);
+    return error.HelperServerUnavailable;
 }
 
 fn authorizeRequest(

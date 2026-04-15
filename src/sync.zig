@@ -4,6 +4,8 @@ const shell = @import("shell.zig");
 const git_proto = @import("git.zig");
 const release_id_raw = @embedFile("RELEASE_ID");
 
+const ENABLE_ATOMIC_WRITES = true;
+
 pub fn beginUpdateWindow(allocator: std.mem.Allocator, root: []const u8) !types.SyncStats {
     var stats = types.SyncStats{};
     const now = std.time.timestamp();
@@ -594,7 +596,7 @@ fn syncSingleSourceRecordShell(
     defer std.fs.deleteTreeAbsolute(tmp_path) catch {};
 
     try shell.runCommand(allocator, &.{
-        "git", "-c", "protocol.file.allow=always", "-c", "safe.directory=*",
+        "git",  "-c",      "protocol.file.allow=always", "-c", "safe.directory=*",
         "init", "--quiet", tmp_path,
     });
     try shell.runCommand(allocator, &.{ "git", "-C", tmp_path, "remote", "add", "origin", record.repo_url });
@@ -702,11 +704,33 @@ fn writeUpdateStatus(
 }
 
 fn writeIntFile(path: []const u8, value: i64) !void {
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
+    if (comptime ENABLE_ATOMIC_WRITES) {
+        try writeIntFileAtomic(path, value);
+    } else {
+        var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+        var buf: [64]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "{d}\n", .{value});
+        try file.writeAll(text);
+    }
+}
+
+fn writeIntFileAtomic(path: []const u8, value: i64) !void {
+    const dirname = std.fs.path.dirname(path) orelse ".";
+    const basename = std.fs.path.basename(path);
+    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/.{s}.{d}.tmp", .{ dirname, basename, std.time.nanoTimestamp() });
+    defer std.heap.page_allocator.free(tmp_path);
+
+    var file = try std.fs.cwd().createFile(tmp_path, .{});
+    errdefer {
+        file.close();
+        std.fs.cwd().deleteFile(tmp_path) catch {};
+    }
     var buf: [64]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, "{d}\n", .{value});
     try file.writeAll(text);
+    file.close();
+    try std.fs.cwd().rename(tmp_path, path);
 }
 
 fn readIntFile(allocator: std.mem.Allocator, path: []const u8) !i64 {
@@ -818,8 +842,9 @@ fn ensureFetchedRemoteTagTarballShell(
     const tag_ref = try std.fmt.allocPrint(allocator, "refs/tags/{s}:refs/tags/{s}", .{ tag, tag });
     defer allocator.free(tag_ref);
     try shell.runCommand(allocator, &.{
-        "git", "-c", "protocol.file.allow=always", "-c", "safe.directory=*",
-        "-C", repo_path, "fetch", "--depth", "1", "--quiet", "origin", tag_ref,
+        "git",     "-c",      "protocol.file.allow=always", "-c",      "safe.directory=*",
+        "-C",      repo_path, "fetch",                      "--depth", "1",
+        "--quiet", "origin",  tag_ref,
     });
 
     const tree_oid = try revParseGitTree(allocator, repo_path, tag);
@@ -882,7 +907,7 @@ fn ensureRepoTarball(
 
 fn listRemoteTagsShell(allocator: std.mem.Allocator, repo_url: []const u8) !std.ArrayList(RemoteTag) {
     const tags_raw = try shell.runCommandOutput(allocator, &.{
-        "git", "-c", "protocol.file.allow=always", "-c", "safe.directory=*",
+        "git",       "-c",     "protocol.file.allow=always", "-c", "safe.directory=*",
         "ls-remote", "--tags", repo_url,
     });
     defer allocator.free(tags_raw);
@@ -1305,9 +1330,29 @@ fn writeSeedFiles(allocator: std.mem.Allocator, source_root: []const u8, source_
 }
 
 fn writeTextFile(path: []const u8, content: []const u8) !void {
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
+    if (comptime ENABLE_ATOMIC_WRITES) {
+        try writeTextFileAtomic(path, content);
+    } else {
+        var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(content);
+    }
+}
+
+fn writeTextFileAtomic(path: []const u8, content: []const u8) !void {
+    const dirname = std.fs.path.dirname(path) orelse ".";
+    const basename = std.fs.path.basename(path);
+    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/.{s}.{d}.tmp", .{ dirname, basename, std.time.nanoTimestamp() });
+    defer std.heap.page_allocator.free(tmp_path);
+
+    var file = try std.fs.cwd().createFile(tmp_path, .{});
+    errdefer {
+        file.close();
+        std.fs.cwd().deleteFile(tmp_path) catch {};
+    }
     try file.writeAll(content);
+    file.close();
+    try std.fs.cwd().rename(tmp_path, path);
 }
 
 fn extractSourceRecords(allocator: std.mem.Allocator, raw: []const u8) !std.ArrayList(types.SourceRecord) {
@@ -1723,8 +1768,8 @@ fn ensureSourceRepo(
 
     if (!pathExists(head_path)) {
         try shell.runCommand(allocator, &[_][]const u8{
-            "git", "-c", "protocol.file.allow=always", "-c", "safe.directory=*",
-            "clone", "--mirror", "--quiet", record.repo_url, bare_repo,
+            "git",   "-c",       "protocol.file.allow=always", "-c",            "safe.directory=*",
+            "clone", "--mirror", "--quiet",                    record.repo_url, bare_repo,
         });
         stats.source_repo_cloned += 1;
         if (record.default_ref.len != 0) {
@@ -1737,10 +1782,9 @@ fn ensureSourceRepo(
     } else if (refresh_existing) {
         shell.runCommand(allocator, &[_][]const u8{ "git", "-C", bare_repo, "remote", "set-url", "origin", record.repo_url }) catch {};
         try shell.runCommand(allocator, &[_][]const u8{
-            "git", "-c", "protocol.file.allow=always", "-c", "safe.directory=*",
-            "-C", bare_repo, "fetch", "--prune", "--tags", "origin",
-            "+refs/heads/*:refs/heads/*",
-            "+refs/tags/*:refs/tags/*",
+            "git",    "-c",                         "protocol.file.allow=always", "-c",      "safe.directory=*",
+            "-C",     bare_repo,                    "fetch",                      "--prune", "--tags",
+            "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*",
         });
         stats.source_repo_updated += 1;
         if (record.default_ref.len != 0) {
