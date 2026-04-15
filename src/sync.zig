@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const shell = @import("shell.zig");
 const git_proto = @import("git.zig");
+const release_id_raw = @embedFile("RELEASE_ID");
 
 pub fn beginUpdateWindow(allocator: std.mem.Allocator, root: []const u8) !types.SyncStats {
     var stats = types.SyncStats{};
@@ -196,6 +197,32 @@ const RemoteTag = struct {
     target: git_proto.Oid,
 };
 
+const TarballManifest = struct {
+    package: []const u8,
+    tag: []const u8,
+    upstream_repo_url: ?[]const u8 = null,
+    git_commit_oid: []const u8,
+    git_tree_oid: ?[]const u8 = null,
+    tarball_sha256: []const u8,
+    tarball_md5: []const u8,
+    tarball_crc32: []const u8,
+    size_bytes: u64,
+    generated_at: i64,
+    packbase_release: []const u8,
+};
+
+const TarballBuildMetadata = struct {
+    git_commit_oid: []u8,
+    git_tree_oid: ?[]u8 = null,
+    upstream_repo_url: ?[]const u8 = null,
+
+    fn deinit(self: *TarballBuildMetadata, allocator: std.mem.Allocator) void {
+        allocator.free(self.git_commit_oid);
+        if (self.git_tree_oid) |oid| allocator.free(oid);
+        self.* = undefined;
+    }
+};
+
 pub fn loadSnapshotProbeData(
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -297,14 +324,14 @@ pub fn collectPackageInfos(allocator: std.mem.Allocator, root: []const u8) !std.
 
         var tarballs = try collectTarballInfos(allocator, tarball_dir);
         defer {
-            for (tarballs.items) |tag_info| allocator.free(tag_info.tag);
+            for (tarballs.items) |tag_info| freePackageTagInfo(allocator, &tag_info);
             tarballs.deinit(allocator);
         }
         std.mem.sort(types.PackageTagInfo, tarballs.items, {}, sortPackageTagInfoAsc);
 
         var tarballs_copy = try allocator.alloc(types.PackageTagInfo, tarballs.items.len);
         errdefer {
-            for (tarballs_copy[0..tarballs.items.len]) |tag_info| allocator.free(tag_info.tag);
+            for (tarballs_copy[0..tarballs.items.len]) |tag_info| freePackageTagInfo(allocator, &tag_info);
             allocator.free(tarballs_copy);
         }
 
@@ -313,6 +340,12 @@ pub fn collectPackageInfos(allocator: std.mem.Allocator, root: []const u8) !std.
             tarballs_copy[index] = .{
                 .tag = try allocator.dupe(u8, tag_info.tag),
                 .size_bytes = tag_info.size_bytes,
+                .manifest_present = tag_info.manifest_present,
+                .git_commit_oid = if (tag_info.git_commit_oid) |oid| try allocator.dupe(u8, oid) else null,
+                .git_tree_oid = if (tag_info.git_tree_oid) |oid| try allocator.dupe(u8, oid) else null,
+                .tarball_sha256 = if (tag_info.tarball_sha256) |hash| try allocator.dupe(u8, hash) else null,
+                .tarball_md5 = if (tag_info.tarball_md5) |hash| try allocator.dupe(u8, hash) else null,
+                .tarball_crc32 = if (tag_info.tarball_crc32) |hash| try allocator.dupe(u8, hash) else null,
             };
             total_size += tag_info.size_bytes;
         }
@@ -340,12 +373,21 @@ pub fn collectPackageInfos(allocator: std.mem.Allocator, root: []const u8) !std.
 pub fn freePackageInfoList(allocator: std.mem.Allocator, infos: *std.ArrayList(types.PackageInfo)) void {
     for (infos.items) |info| {
         allocator.free(info.package);
-        for (info.tarballs) |tag_info| allocator.free(tag_info.tag);
+        for (info.tarballs) |tag_info| freePackageTagInfo(allocator, &tag_info);
         allocator.free(info.tarballs);
         if (info.fetch_probe_commit) |commit| allocator.free(commit);
         if (info.fetch_probe_error) |probe_error| allocator.free(probe_error);
     }
     infos.deinit(allocator);
+}
+
+fn freePackageTagInfo(allocator: std.mem.Allocator, tag_info: *const types.PackageTagInfo) void {
+    allocator.free(tag_info.tag);
+    if (tag_info.git_commit_oid) |oid| allocator.free(oid);
+    if (tag_info.git_tree_oid) |oid| allocator.free(oid);
+    if (tag_info.tarball_sha256) |hash| allocator.free(hash);
+    if (tag_info.tarball_md5) |hash| allocator.free(hash);
+    if (tag_info.tarball_crc32) |hash| allocator.free(hash);
 }
 
 pub fn writePackageInfoSnapshot(allocator: std.mem.Allocator, root: []const u8, infos: []const types.PackageInfo) !void {
@@ -526,7 +568,7 @@ pub fn syncSingleSourceRecord(
     const before_created = stats.tarballs_created;
     const before_present = stats.tarballs_present;
     for (tags.items) |tag| {
-        try ensureFetchedRemoteTagTarballProto(allocator, root, record.package_name, tag, session, stats);
+        try ensureFetchedRemoteTagTarballProto(allocator, root, record.package_name, tag, record.repo_url, session, stats);
     }
 
     return .{
@@ -560,7 +602,7 @@ fn syncSingleSourceRecordShell(
     const before_created = stats.tarballs_created;
     const before_present = stats.tarballs_present;
     for (tags.items) |tag| {
-        try ensureFetchedRemoteTagTarballShell(allocator, root, tmp_path, record.package_name, tag.name, stats);
+        try ensureFetchedRemoteTagTarballShell(allocator, root, tmp_path, record.package_name, tag.name, record.repo_url, stats);
     }
 
     return .{
@@ -748,6 +790,7 @@ fn ensureFetchedRemoteTagTarballShell(
     repo_path: []const u8,
     package_name: []const u8,
     tag: []const u8,
+    upstream_repo_url: []const u8,
     stats: *types.SyncStats,
 ) !void {
     const pkg_dir = try std.fs.path.join(allocator, &.{ root, "p", package_name, "tag" });
@@ -759,10 +802,14 @@ fn ensureFetchedRemoteTagTarballShell(
     const tarball_path = try std.fs.path.join(allocator, &.{ pkg_dir, tarball_name });
     defer allocator.free(tarball_path);
 
+    const commit_oid = try revParseGitCommit(allocator, repo_path, tag);
+    defer allocator.free(commit_oid);
     if (std.fs.cwd().access(tarball_path, .{})) |_| {
-        stats.tarballs_present += 1;
-        std.log.info("tarball present package={s} tag={s}", .{ package_name, tag });
-        return;
+        if (try manifestMatchesCommit(allocator, root, package_name, tag, commit_oid)) {
+            stats.tarballs_present += 1;
+            std.log.info("tarball present package={s} tag={s}", .{ package_name, tag });
+            return;
+        }
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
@@ -775,7 +822,14 @@ fn ensureFetchedRemoteTagTarballShell(
         "-C", repo_path, "fetch", "--depth", "1", "--quiet", "origin", tag_ref,
     });
 
+    const tree_oid = try revParseGitTree(allocator, repo_path, tag);
+    defer if (tree_oid) |oid| allocator.free(oid);
     try archiveGitTag(allocator, repo_path, tag, tarball_path);
+    try writeTarballManifest(allocator, root, package_name, tag, .{
+        .git_commit_oid = try allocator.dupe(u8, commit_oid),
+        .git_tree_oid = if (tree_oid) |oid| try allocator.dupe(u8, oid) else null,
+        .upstream_repo_url = upstream_repo_url,
+    });
     stats.tarballs_created += 1;
     std.log.info("tarball created package={s} tag={s}", .{ package_name, tag });
 }
@@ -801,16 +855,27 @@ fn ensureRepoTarball(
         try shell.runCommand(allocator, &[_][]const u8{ "mkdir", "-p", tarball_parent });
     }
 
+    const commit_oid = try revParseGitCommit(allocator, repo_path, tag);
+    defer allocator.free(commit_oid);
     if (std.fs.cwd().access(tarball_path, .{})) |_| {
-        stats.tarballs_present += 1;
-        std.log.info("tarball present package={s} tag={s}", .{ package_name, tag });
-        return;
+        if (try manifestMatchesCommit(allocator, root, package_name, tag, commit_oid)) {
+            stats.tarballs_present += 1;
+            std.log.info("tarball present package={s} tag={s}", .{ package_name, tag });
+            return;
+        }
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     }
 
+    const tree_oid = try revParseGitTree(allocator, repo_path, tag);
+    defer if (tree_oid) |oid| allocator.free(oid);
     try archiveGitTag(allocator, repo_path, tag, tarball_path);
+    try writeTarballManifest(allocator, root, package_name, tag, .{
+        .git_commit_oid = try allocator.dupe(u8, commit_oid),
+        .git_tree_oid = if (tree_oid) |oid| try allocator.dupe(u8, oid) else null,
+        .upstream_repo_url = null,
+    });
     stats.tarballs_created += 1;
     std.log.info("tarball created package={s} tag={s}", .{ package_name, tag });
 }
@@ -818,14 +883,21 @@ fn ensureRepoTarball(
 fn listRemoteTagsShell(allocator: std.mem.Allocator, repo_url: []const u8) !std.ArrayList(RemoteTag) {
     const tags_raw = try shell.runCommandOutput(allocator, &.{
         "git", "-c", "protocol.file.allow=always", "-c", "safe.directory=*",
-        "ls-remote", "--tags", "--refs", repo_url,
+        "ls-remote", "--tags", repo_url,
     });
     defer allocator.free(tags_raw);
 
-    var tags = std.ArrayList(RemoteTag).empty;
-    errdefer {
-        freeRemoteTagList(allocator, &tags);
-        tags.deinit(allocator);
+    var peeled = std.StringHashMap(git_proto.Oid).init(allocator);
+    defer {
+        var peeled_it = peeled.iterator();
+        while (peeled_it.next()) |entry| allocator.free(entry.key_ptr.*);
+        peeled.deinit();
+    }
+    var direct = std.StringHashMap(git_proto.Oid).init(allocator);
+    defer {
+        var direct_it = direct.iterator();
+        while (direct_it.next()) |entry| allocator.free(entry.key_ptr.*);
+        direct.deinit();
     }
 
     var lines = std.mem.splitScalar(u8, tags_raw, '\n');
@@ -835,12 +907,26 @@ fn listRemoteTagsShell(allocator: std.mem.Allocator, repo_url: []const u8) !std.
         const tab = std.mem.indexOfScalar(u8, trimmed, '\t') orelse continue;
         const ref_name = trimmed[tab + 1 ..];
         if (!std.mem.startsWith(u8, ref_name, "refs/tags/")) continue;
-        try tags.append(allocator, .{
-            .name = try allocator.dupe(u8, ref_name["refs/tags/".len..]),
-            .target = git_proto.Oid.parseAny(trimmed[0..tab]) catch continue,
-        });
+        const tag_name = ref_name["refs/tags/".len..];
+        const oid = git_proto.Oid.parseAny(trimmed[0..tab]) catch continue;
+        if (std.mem.endsWith(u8, tag_name, "^{}")) {
+            try peeled.put(try allocator.dupe(u8, tag_name[0 .. tag_name.len - 3]), oid);
+        } else {
+            try direct.put(try allocator.dupe(u8, tag_name), oid);
+        }
     }
 
+    var tags = std.ArrayList(RemoteTag).empty;
+    errdefer {
+        freeRemoteTagList(allocator, &tags);
+    }
+    var it = direct.iterator();
+    while (it.next()) |entry| {
+        try tags.append(allocator, .{
+            .name = try allocator.dupe(u8, entry.key_ptr.*),
+            .target = peeled.get(entry.key_ptr.*) orelse entry.value_ptr.*,
+        });
+    }
     std.mem.sort(RemoteTag, tags.items, {}, sortRemoteTagAsc);
     return tags;
 }
@@ -861,7 +947,6 @@ fn listRemoteTagsProto(
     var tags = std.ArrayList(RemoteTag).empty;
     errdefer {
         freeRemoteTagList(allocator, &tags);
-        tags.deinit(allocator);
     }
 
     while (try it.next()) |ref| {
@@ -881,6 +966,7 @@ fn ensureFetchedRemoteTagTarballProto(
     root: []const u8,
     package_name: []const u8,
     tag: RemoteTag,
+    upstream_repo_url: []const u8,
     session: git_proto.Session,
     stats: *types.SyncStats,
 ) !void {
@@ -890,7 +976,9 @@ fn ensureFetchedRemoteTagTarballProto(
 
     const tarball_path = try tarballPathFor(allocator, root, package_name, tag.name);
     defer allocator.free(tarball_path);
-    if (pathExists(tarball_path)) {
+    const commit = try std.fmt.allocPrint(allocator, "{x}", .{tag.target.slice()});
+    defer allocator.free(commit);
+    if (pathExists(tarball_path) and try manifestMatchesCommit(allocator, root, package_name, tag.name, commit)) {
         stats.tarballs_present += 1;
         std.log.info("tarball present package={s} tag={s}", .{ package_name, tag.name });
         return;
@@ -927,11 +1015,10 @@ fn ensureFetchedRemoteTagTarballProto(
         try pack_file.writeAll(pack_bytes);
     }
 
-    const commit = try std.fmt.allocPrint(allocator, "{x}", .{tag.target.slice()});
-    defer allocator.free(commit);
     try shell.runCommand(allocator, &.{ "git", "-C", repo_path, "index-pack", ".git/objects/pack/packbase.pack" });
     try shell.runCommand(allocator, &.{ "git", "-C", repo_path, "checkout", "--quiet", "--detach", commit });
-    std.fs.deleteTreeAbsolute(try std.fs.path.join(allocator, &.{ repo_path, ".git" })) catch {};
+    const tree_oid = try revParseGitTree(allocator, repo_path, "HEAD");
+    defer if (tree_oid) |oid| allocator.free(oid);
 
     try shell.runCommand(allocator, &.{
         "tar",
@@ -941,6 +1028,14 @@ fn ensureFetchedRemoteTagTarballProto(
         "-C",
         repo_path,
         ".",
+    });
+    const git_dir = try std.fs.path.join(allocator, &.{ repo_path, ".git" });
+    defer allocator.free(git_dir);
+    std.fs.deleteTreeAbsolute(git_dir) catch {};
+    try writeTarballManifest(allocator, root, package_name, tag.name, .{
+        .git_commit_oid = try allocator.dupe(u8, commit),
+        .git_tree_oid = if (tree_oid) |oid| try allocator.dupe(u8, oid) else null,
+        .upstream_repo_url = upstream_repo_url,
     });
 
     stats.tarballs_created += 1;
@@ -960,6 +1055,12 @@ fn tarballPathFor(allocator: std.mem.Allocator, root: []const u8, package_name: 
     const tarball_name = try std.fmt.allocPrint(allocator, "{s}.tar.gz", .{tag});
     defer allocator.free(tarball_name);
     return std.fs.path.join(allocator, &.{ root, "p", package_name, "tag", tarball_name });
+}
+
+fn manifestPathFor(allocator: std.mem.Allocator, root: []const u8, package_name: []const u8, tag: []const u8) ![]u8 {
+    const manifest_name = try std.fmt.allocPrint(allocator, "{s}.manifest.json", .{tag});
+    defer allocator.free(manifest_name);
+    return std.fs.path.join(allocator, &.{ root, "p", package_name, "tag", manifest_name });
 }
 
 fn isHttpGitUrl(url: []const u8) bool {
@@ -990,6 +1091,121 @@ fn archiveGitTag(allocator: std.mem.Allocator, repo_path: []const u8, tag: []con
         .Exited => |code| if (code != 0) return error.CommandFailed,
         else => return error.CommandFailed,
     }
+}
+
+fn revParseGitCommit(allocator: std.mem.Allocator, repo_path: []const u8, rev: []const u8) ![]u8 {
+    const expr = try std.fmt.allocPrint(allocator, "{s}^{{commit}}", .{rev});
+    defer allocator.free(expr);
+    const raw = try shell.runCommandOutput(allocator, &.{ "git", "-C", repo_path, "rev-parse", expr });
+    defer allocator.free(raw);
+    return allocator.dupe(u8, std.mem.trim(u8, raw, " \t\r\n"));
+}
+
+fn revParseGitTree(allocator: std.mem.Allocator, repo_path: []const u8, rev: []const u8) !?[]u8 {
+    const expr = try std.fmt.allocPrint(allocator, "{s}^{{tree}}", .{rev});
+    defer allocator.free(expr);
+    const raw = shell.runCommandOutput(allocator, &.{ "git", "-C", repo_path, "rev-parse", expr }) catch return null;
+    defer allocator.free(raw);
+    return try allocator.dupe(u8, std.mem.trim(u8, raw, " \t\r\n"));
+}
+
+const TarballDigests = struct {
+    sha256: []u8,
+    md5: []u8,
+    crc32: []u8,
+};
+
+fn computeTarballDigests(allocator: std.mem.Allocator, tarball_path: []const u8) !TarballDigests {
+    var file = try std.fs.cwd().openFile(tarball_path, .{});
+    defer file.close();
+
+    var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
+    var md5 = std.crypto.hash.Md5.init(.{});
+    var crc32 = std.hash.Crc32.init();
+
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = try file.read(&buf);
+        if (n == 0) break;
+        sha256.update(buf[0..n]);
+        md5.update(buf[0..n]);
+        crc32.update(buf[0..n]);
+    }
+
+    var sha256_bytes: [32]u8 = undefined;
+    sha256.final(&sha256_bytes);
+    var md5_bytes: [16]u8 = undefined;
+    md5.final(&md5_bytes);
+    return .{
+        .sha256 = try std.fmt.allocPrint(allocator, "{x}", .{sha256_bytes}),
+        .md5 = try std.fmt.allocPrint(allocator, "{x}", .{md5_bytes}),
+        .crc32 = try std.fmt.allocPrint(allocator, "{x:0>8}", .{crc32.final()}),
+    };
+}
+
+fn manifestMatchesCommit(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    package_name: []const u8,
+    tag: []const u8,
+    commit_oid: []const u8,
+) !bool {
+    const manifest_path = try manifestPathFor(allocator, root, package_name, tag);
+    defer allocator.free(manifest_path);
+    const raw = try readOptionalFileAlloc(allocator, manifest_path, 64 * 1024) orelse return false;
+    defer allocator.free(raw);
+    const parsed = try std.json.parseFromSlice(TarballManifest, allocator, raw, .{});
+    defer parsed.deinit();
+    return std.mem.eql(u8, parsed.value.git_commit_oid, commit_oid);
+}
+
+fn writeTarballManifest(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    package_name: []const u8,
+    tag: []const u8,
+    build: TarballBuildMetadata,
+) !void {
+    var build_meta = build;
+    defer build_meta.deinit(allocator);
+
+    const tarball_path = try tarballPathFor(allocator, root, package_name, tag);
+    defer allocator.free(tarball_path);
+    const manifest_path = try manifestPathFor(allocator, root, package_name, tag);
+    defer allocator.free(manifest_path);
+    const digests = try computeTarballDigests(allocator, tarball_path);
+    defer {
+        allocator.free(digests.sha256);
+        allocator.free(digests.md5);
+        allocator.free(digests.crc32);
+    }
+    const stat = try std.fs.cwd().statFile(tarball_path);
+    const release_id = std.mem.trimRight(u8, release_id_raw, "\r\n");
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, "{\"package\":");
+    try appendJsonString(allocator, &body, package_name);
+    try body.appendSlice(allocator, ",\"tag\":");
+    try appendJsonString(allocator, &body, tag);
+    try body.appendSlice(allocator, ",\"upstream_repo_url\":");
+    if (build_meta.upstream_repo_url) |url| try appendJsonString(allocator, &body, url) else try body.appendSlice(allocator, "null");
+    try body.appendSlice(allocator, ",\"git_commit_oid\":");
+    try appendJsonString(allocator, &body, build_meta.git_commit_oid);
+    try body.appendSlice(allocator, ",\"git_tree_oid\":");
+    if (build_meta.git_tree_oid) |oid| try appendJsonString(allocator, &body, oid) else try body.appendSlice(allocator, "null");
+    try body.appendSlice(allocator, ",\"tarball_sha256\":");
+    try appendJsonString(allocator, &body, digests.sha256);
+    try body.appendSlice(allocator, ",\"tarball_md5\":");
+    try appendJsonString(allocator, &body, digests.md5);
+    try body.appendSlice(allocator, ",\"tarball_crc32\":");
+    try appendJsonString(allocator, &body, digests.crc32);
+    try body.writer(allocator).print(",\"size_bytes\":{d},\"generated_at\":{d},\"packbase_release\":\"{s}\"}}\n", .{
+        stat.size,
+        std.time.timestamp(),
+        release_id,
+    });
+    try writeTextFile(manifest_path, body.items);
 }
 
 fn ensureBuiltInHelloSeed(allocator: std.mem.Allocator, root: []const u8) !bool {
@@ -1283,9 +1499,30 @@ fn collectTarballInfos(allocator: std.mem.Allocator, tarball_dir: []const u8) !s
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".tar.gz")) continue;
         const stat = try dir.statFile(entry.name);
+        const tag_name = entry.name[0 .. entry.name.len - ".tar.gz".len];
+        const manifest_name = try std.fmt.allocPrint(allocator, "{s}.manifest.json", .{tag_name});
+        defer allocator.free(manifest_name);
+        const manifest = blk: {
+            var manifest_file = dir.openFile(manifest_name, .{}) catch |err| switch (err) {
+                error.FileNotFound => break :blk null,
+                else => return err,
+            };
+            defer manifest_file.close();
+            const raw = try manifest_file.readToEndAlloc(allocator, 64 * 1024);
+            defer allocator.free(raw);
+            const parsed = try std.json.parseFromSlice(TarballManifest, allocator, raw, .{});
+            defer parsed.deinit();
+            break :blk parsed.value;
+        };
         try tags.append(allocator, .{
-            .tag = try allocator.dupe(u8, entry.name[0 .. entry.name.len - ".tar.gz".len]),
+            .tag = try allocator.dupe(u8, tag_name),
             .size_bytes = @intCast(stat.size),
+            .manifest_present = manifest != null,
+            .git_commit_oid = if (manifest) |m| try allocator.dupe(u8, m.git_commit_oid) else null,
+            .git_tree_oid = if (manifest) |m| if (m.git_tree_oid) |oid| try allocator.dupe(u8, oid) else null else null,
+            .tarball_sha256 = if (manifest) |m| try allocator.dupe(u8, m.tarball_sha256) else null,
+            .tarball_md5 = if (manifest) |m| try allocator.dupe(u8, m.tarball_md5) else null,
+            .tarball_crc32 = if (manifest) |m| try allocator.dupe(u8, m.tarball_crc32) else null,
         });
     }
     return tags;
@@ -1411,7 +1648,20 @@ fn appendPackageInfoJson(allocator: std.mem.Allocator, body: *std.ArrayList(u8),
         if (index != 0) try body.append(allocator, ',');
         try body.appendSlice(allocator, "{\"tag\":");
         try appendJsonString(allocator, body, tag_info.tag);
-        try body.writer(allocator).print(",\"size_bytes\":{d}}}", .{tag_info.size_bytes});
+        try body.writer(allocator).print(",\"size_bytes\":{d}", .{tag_info.size_bytes});
+        try body.appendSlice(allocator, ",\"manifest_present\":");
+        try body.appendSlice(allocator, if (tag_info.manifest_present) "true" else "false");
+        try body.appendSlice(allocator, ",\"git_commit_oid\":");
+        if (tag_info.git_commit_oid) |oid| try appendJsonString(allocator, body, oid) else try body.appendSlice(allocator, "null");
+        try body.appendSlice(allocator, ",\"git_tree_oid\":");
+        if (tag_info.git_tree_oid) |oid| try appendJsonString(allocator, body, oid) else try body.appendSlice(allocator, "null");
+        try body.appendSlice(allocator, ",\"tarball_sha256\":");
+        if (tag_info.tarball_sha256) |hash| try appendJsonString(allocator, body, hash) else try body.appendSlice(allocator, "null");
+        try body.appendSlice(allocator, ",\"tarball_md5\":");
+        if (tag_info.tarball_md5) |hash| try appendJsonString(allocator, body, hash) else try body.appendSlice(allocator, "null");
+        try body.appendSlice(allocator, ",\"tarball_crc32\":");
+        if (tag_info.tarball_crc32) |hash| try appendJsonString(allocator, body, hash) else try body.appendSlice(allocator, "null");
+        try body.appendSlice(allocator, "}");
     }
     try body.appendSlice(allocator, "],\"smart_http_ready\":");
     try body.appendSlice(allocator, if (info.smart_http_ready) "true" else "false");

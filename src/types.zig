@@ -65,6 +65,12 @@ pub const SyncStats = struct {
 pub const PackageTagInfo = struct {
     tag: []const u8,
     size_bytes: u64 = 0,
+    manifest_present: bool = false,
+    git_commit_oid: ?[]const u8 = null,
+    git_tree_oid: ?[]const u8 = null,
+    tarball_sha256: ?[]const u8 = null,
+    tarball_md5: ?[]const u8 = null,
+    tarball_crc32: ?[]const u8 = null,
 };
 
 pub const PackageInfo = struct {

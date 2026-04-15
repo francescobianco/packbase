@@ -172,7 +172,16 @@ Le informazioni non vengono calcolate on demand: se manca lo snapshot, va esegui
   "latest_tag": "v0.1.0",
   "latest_size_bytes": 371,
   "size_bytes": 371,
-  "tarballs": [{"tag": "v0.1.0", "size_bytes": 371}],
+  "tarballs": [{
+    "tag": "v0.1.0",
+    "size_bytes": 371,
+    "manifest_present": true,
+    "git_commit_oid": "ce919ccf45951856a762ffdb8ef850301cd8c588",
+    "git_tree_oid": "ce919ccf45951856a762ffdb8ef850301cd8c588",
+    "tarball_sha256": "…",
+    "tarball_md5": "…",
+    "tarball_crc32": "…"
+  }],
   "smart_http_ready": true,
   "pseudo_git_fetchable": true,
   "healthy": true

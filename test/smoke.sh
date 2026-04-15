@@ -162,6 +162,11 @@ printf 'api/fetch response: %s\n' "$FETCH_RESP"
 # Extract the package URL from the JSON response.
 PKG_URL="$(printf '%s' "$FETCH_RESP" | sed 's/.*"url":"\([^"]*\)".*/\1/')"
 test -n "$PKG_URL"
+FETCH_TAG="$(printf '%s' "$FETCH_RESP" | sed 's/.*"tag":"\([^"]*\)".*/\1/')"
+test -n "$FETCH_TAG"
+printf '%s' "$FETCH_RESP" | grep -Eq '"tarball_count":[1-9][0-9]*'
+
+docker exec "$CONTAINER_NAME" test -f "/var/lib/packbase/public/p/serde.zig/tag/${FETCH_TAG}.manifest.json"
 
 printf 'api/fetch: OK (%s)\n' "$PKG_URL"
 
@@ -248,6 +253,9 @@ printf '%s' "$CHECK_RESP" | grep -q '"package":"hello"'
 printf '%s' "$CHECK_RESP" | grep -q '"healthy":true'
 printf '%s' "$CHECK_RESP" | grep -q '"tarball_count":1'
 printf '%s' "$CHECK_RESP" | grep -Eq '"size_bytes":[1-9][0-9]*'
+printf '%s' "$CHECK_RESP" | grep -q '"manifest_present":true'
+printf '%s' "$CHECK_RESP" | grep -q '"git_commit_oid":"'
+printf '%s' "$CHECK_RESP" | grep -q '"tarball_sha256":"'
 
 printf 'api/info/<package>: OK\n'
 

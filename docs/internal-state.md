@@ -15,7 +15,9 @@ All persistent data lives under `PACKBASE_ROOT` (default: `/data` in the Docker 
 │   └── {package}/
 │       └── tag/
 │           ├── v1.0.0.tar.gz
-│           └── v1.2.3.tar.gz
+│           ├── v1.0.0.manifest.json
+│           ├── v1.2.3.tar.gz
+│           └── v1.2.3.manifest.json
 └── .packbase/                  # all internal state (never served directly)
     ├── update.lock
     ├── update.pending
@@ -34,16 +36,33 @@ All persistent data lives under `PACKBASE_ROOT` (default: `/data` in the Docker 
 
 ## Tarballs (`p/`)
 
-**Path:** `{root}/p/{package_name}/tag/{tag}.tar.gz`
+**Paths:**
+- `{root}/p/{package_name}/tag/{tag}.tar.gz`
+- `{root}/p/{package_name}/tag/{tag}.manifest.json`
 
 Tarballs are the primary truth of the registry. They are:
 - Created from the upstream tag snapshot and written atomically under `p/`.
 - Deterministic: the same tag always produces the same bytes.
 - Immutable once written: never overwritten.
 
+Each tarball is paired with a manifest containing:
+- the upstream Git commit used to generate it (`git_commit_oid`)
+- the Git tree hash when available (`git_tree_oid`)
+- integrity hashes of the tarball (`sha256`, `md5`, `crc32`)
+- file size, generation timestamp, upstream repo URL, and packbase release id
+
 There are two materialization paths:
 1. **`POST /api/fetch`** — atomic sync of a single package, materializing all remote tags immediately.
 2. **`POST /api/update`** — walks the source catalog and materializes packages selectively, skipping entries whose upstream `updated_at` is unchanged.
+
+When a package needs to be revisited, Packbase does not blindly rebuild every tarball:
+1. reads the remote tag refs
+2. resolves the tag to its effective Git commit
+3. loads `{tag}.manifest.json` if present
+4. compares `git_commit_oid`
+5. skips tarball regeneration when the commit matches
+
+This means `updated_at` in the source catalog is only a coarse invalidation hint. The actual decision to rebuild a specific tag is based on the Git commit recorded in the tag manifest.
 
 For HTTP(S) remotes, Packbase uses the low-level Git protocol client implemented in `src/git.zig` to list refs and fetch packfiles. Local fallback transport is still used only for non-HTTP sources such as `file://` fixtures.
 
@@ -147,8 +166,26 @@ Each entry describes one package:
   "latest_size_bytes": 12345,
   "size_bytes": 23456,
   "tarballs": [
-    {"tag": "v0.2.0", "size_bytes": 11111},
-    {"tag": "v0.3.0", "size_bytes": 12345}
+    {
+      "tag": "v0.2.0",
+      "size_bytes": 11111,
+      "manifest_present": true,
+      "git_commit_oid": "abc123",
+      "git_tree_oid": "def456",
+      "tarball_sha256": "…",
+      "tarball_md5": "…",
+      "tarball_crc32": "…"
+    },
+    {
+      "tag": "v0.3.0",
+      "size_bytes": 12345,
+      "manifest_present": true,
+      "git_commit_oid": "fedcba",
+      "git_tree_oid": "654321",
+      "tarball_sha256": "…",
+      "tarball_md5": "…",
+      "tarball_crc32": "…"
+    }
   ],
   "smart_http_ready": true,
   "pseudo_git_fetchable": true,
@@ -164,6 +201,7 @@ Fields:
 - `registered`: appears in the source catalog (`registered.json`).
 - `local`: has a tarball directory on disk (`p/{package}/tag/`).
 - `tarball_dir_present`: the `tag/` directory exists.
+- `manifest_present`: a per-tag manifest JSON exists next to the tarball.
 - `smart_http_ready`: at least one tarball is present; pseudo-Git HTTP can serve it.
 - `pseudo_git_fetchable`: a `zig fetch` probe ran successfully against this package.
 - `fetch_probe_commit`: the Git commit SHA returned by the probe.
