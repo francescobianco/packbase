@@ -860,10 +860,10 @@ fn handleUploadPackRequest(
     const body = http.findBody(raw);
     const tmp_name = try std.fmt.allocPrint(allocator, "gitreq-{d}", .{std.time.nanoTimestamp()});
     defer allocator.free(tmp_name);
-    const tmp_input = try std.fs.path.join(allocator, &.{ "/tmp", tmp_name });
+    const tmp_input = try std.fmt.allocPrint(allocator, "/tmp/{s}", .{tmp_name});
     defer {
-        allocator.free(tmp_input);
         std.fs.deleteFileAbsolute(tmp_input) catch {};
+        allocator.free(tmp_input);
     }
 
     std.log.info(

@@ -30,7 +30,7 @@ if ! RELEASE_RESP="$(curl -fsS "$INFO_URL")"; then
     exit 1
 fi
 
-REMOTE_RELEASE="$(printf '%s' "$RELEASE_RESP" | sed 's/.*"release":"\([^"]*\)".*/\1/')"
+REMOTE_RELEASE="$(printf '%s' "$RELEASE_RESP" | tr -d '\n' | sed -n 's/.*"release":"\([^"]*\)".*/\1/p')"
 
 if [ -z "$REMOTE_RELEASE" ]; then
     printf 'could not parse release identifier from %s\n' "$INFO_URL" >&2
@@ -159,7 +159,7 @@ ZON
 (cd "$FETCH_REPEAT_DIR" && zig fetch --save "git+${REMOTE_URL}" --global-cache-dir .zig-cache)
 
 POST_FETCH_INFO="$(curl -fsS "$INFO_URL")"
-POST_FETCH_RELEASE="$(printf '%s' "$POST_FETCH_INFO" | sed 's/.*"release":"\([^"]*\)".*/\1/')"
+POST_FETCH_RELEASE="$(printf '%s' "$POST_FETCH_INFO" | tr -d '\n' | sed -n 's/.*"release":"\([^"]*\)".*/\1/p')"
 
 if [ "$POST_FETCH_RELEASE" != "$REMOTE_RELEASE" ]; then
     printf 'release changed or server unhealthy after repeated zig fetch: before=%s after=%s\n' "$REMOTE_RELEASE" "$POST_FETCH_RELEASE" >&2
