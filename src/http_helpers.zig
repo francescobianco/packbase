@@ -144,7 +144,7 @@ pub fn sendLandingPage(connection: *std.net.Server.Connection, head_only: bool) 
         \\<head>
         \\  <meta charset="UTF-8">
         \\  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        \\  <title>packbase</title>
+        \\  <title>Packbase</title>
         \\  <style>
         \\    * { box-sizing: border-box; margin: 0; padding: 0; }
         \\    body {
@@ -212,15 +212,17 @@ pub fn sendLandingPage(connection: *std.net.Server.Connection, head_only: bool) 
         \\</head>
         \\<body>
         \\  <header>
-        \\    packbase
-        \\    <span>self-hosted Zig package registry</span>
+        \\    Packbase
+        \\    <span>self-hosted package registry</span>
         \\  </header>
         \\  <main>
-        \\    <h1>packbase</h1>
+        \\    <h1>Packbase</h1>
         \\    <p class="subtitle">
-        \\      This server mirrors upstream Git repositories and serves deterministic
-        \\      tarballs so that <code>zig fetch</code> never has to reach GitHub at
-        \\      install time.
+        \\      Packbase is a pseudo-git delivery server: it generates deterministic tarballs
+        \\      from the releases, tags, and branches of upstream Git repositories and exposes
+        \\      them as package archives — no internal mirroring of repositories takes place.
+        \\      Packages can carry a <code>language</code> field in the registry source, making
+        \\      Packbase suitable for any language ecosystem, not just one.
         \\    </p>
         \\    <table>
         \\      <thead>
@@ -230,12 +232,12 @@ pub fn sendLandingPage(connection: *std.net.Server.Connection, head_only: bool) 
         \\        <tr>
         \\          <td><span class="method post">POST</span></td>
         \\          <td><code>/api/fetch</code></td>
-        \\          <td>Mirror an upstream Git repository.</td>
+        \\          <td>Register an upstream Git repository and make its tarballs available. <strong>Requires a bearer token</strong> — the only endpoint that does.</td>
         \\        </tr>
         \\        <tr>
         \\          <td><span class="method post">POST</span></td>
         \\          <td><code>/api/update</code></td>
-        \\          <td>Soft-sync local state and the configured package source.</td>
+        \\          <td>Soft-sync local state with the configured package source (<code>PACKBASE_SOURCE</code>).</td>
         \\        </tr>
         \\        <tr>
         \\          <td><span class="method get">GET</span></td>
@@ -244,13 +246,18 @@ pub fn sendLandingPage(connection: *std.net.Server.Connection, head_only: bool) 
         \\        </tr>
         \\        <tr>
         \\          <td><span class="method get">GET</span></td>
-        \\          <td><code>/api/info</code></td>
+        \\          <td><code>/api/status</code></td>
         \\          <td>Return service metadata including the current release id.</td>
         \\        </tr>
         \\        <tr>
         \\          <td><span class="method get">GET</span></td>
+        \\          <td><code>/api/info/&lt;package&gt;</code></td>
+        \\          <td>Return metadata for a specific hosted package.</td>
+        \\        </tr>
+        \\        <tr>
+        \\          <td><span class="method get">GET</span></td>
         \\          <td><code>/&lt;repo&gt;/&#8230;</code></td>
-        \\          <td>Alias for cloning hosted repositories without the <code>/git</code> prefix.</td>
+        \\          <td>Serve tarballs and pseudo-git endpoints for hosted packages.</td>
         \\        </tr>
         \\      </tbody>
         \\    </table>
